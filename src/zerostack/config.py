@@ -95,6 +95,8 @@ class ObservabilitySettings(BaseSettings):
     export_traces: bool = False
     log_level: str = "INFO"
     trace_log_path: Path = DEFAULT_DATA_DIR / "traces.jsonl"
+    # Caps the in memory span buffer. The JSONL log keeps the full history.
+    max_retained_spans: int = 1000
 
 
 class Settings(BaseSettings):

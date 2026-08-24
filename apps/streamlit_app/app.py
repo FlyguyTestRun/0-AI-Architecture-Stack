@@ -53,7 +53,7 @@ with st.sidebar:
     st.caption(f"tools: {', '.join(layers['tools']['names']) or 'none'}")
 
     st.divider()
-    if st.button("Ingest sample corpus", use_container_width=True):
+    if st.button("Ingest sample corpus", width="stretch"):
         with st.spinner("Indexing..."):
             report = app.ingest()
         st.success(f"Indexed {report['chunks']} chunk(s) from {report['files']} file(s)")
@@ -113,7 +113,7 @@ with st.expander("Recent runs"):
                 }
                 for record in records
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:

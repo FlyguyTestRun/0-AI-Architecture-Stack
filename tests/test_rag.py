@@ -199,3 +199,128 @@ class TestBackendSelection:
         fallback = build_vector_store(settings.rag)
         assert fallback is not None
         assert fallback.name in {"qdrant", "memory"}
+
+
+def _positional_text(length: int) -> str:
+    """Text with no repeating window, so str.find locates a chunk unambiguously.
+
+    Cyclic filler such as a repeated alphabet makes find() match an earlier
+    identical window, which understates coverage and fails a correct splitter.
+    """
+    text = "".join(f"{index:03d}" for index in range(length))
+    return text[:length]
+
+
+class TestChunkingValidation:
+    """A bad chunking parameter must fail loudly, never lose text quietly."""
+
+    @pytest.mark.parametrize("overlap", [-1, -5, -100])
+    def test_negative_overlap_is_rejected(self, overlap):
+        # A negative overlap makes the window step exceed the window, which skips
+        # the text in between. An earlier version accepted it and silently
+        # dropped roughly 80 percent of a document.
+        with pytest.raises(ValueError, match="must not be negative"):
+            chunk_text("x" * 500, source="s", chunk_size=100, chunk_overlap=overlap)
+
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_non_positive_chunk_size_is_rejected(self, size):
+        with pytest.raises(ValueError, match="must be positive"):
+            chunk_text("x" * 100, source="s", chunk_size=size)
+
+    def test_zero_overlap_is_allowed_and_loses_nothing(self):
+        text = _positional_text(500)
+        chunks = chunk_text(text, source="s", chunk_size=100, chunk_overlap=0)
+        assert "".join(chunk.text for chunk in chunks) == text
+
+    def test_windowing_covers_the_whole_paragraph(self):
+        text = _positional_text(600)
+        chunks = chunk_text(text, source="s", chunk_size=100, chunk_overlap=20)
+        covered: set[int] = set()
+        for chunk in chunks:
+            start = text.find(chunk.text)
+            assert start >= 0
+            covered.update(range(start, start + len(chunk.text)))
+        assert covered == set(range(len(text))), "windowing skipped part of the text"
+
+
+class TestStoreResetParity:
+    """reset() must leave every backend usable, or backends are not swappable."""
+
+    def test_memory_store_is_usable_after_reset(self):
+        store = MemoryVectorStore()
+        store.ensure_collection(64)
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text("refund policy details", source="a.md")
+        vectors = provider.embed([c.text for c in chunks])
+
+        store.upsert(chunks, vectors)
+        store.reset()
+        assert store.count() == 0
+        store.upsert(chunks, vectors)
+        assert store.count() == 1
+
+    def test_qdrant_store_is_usable_after_reset(self, tmp_path):
+        from zerostack.rag.store import QdrantVectorStore
+
+        store = QdrantVectorStore(url=str(tmp_path / "q"), collection="zerostack")
+        store.ensure_collection(64)
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text("refund policy details", source="a.md")
+        vectors = provider.embed([c.text for c in chunks])
+
+        store.upsert(chunks, vectors)
+        store.reset()
+        assert store.count() == 0
+        # Previously raised "collection not found" here.
+        store.upsert(chunks, vectors)
+        assert store.count() == 1
+
+
+class TestChromaBackend:
+    """Chroma is a supported backend, so it needs the same guarantees."""
+
+    @pytest.fixture
+    def chroma(self, tmp_path):
+        pytest.importorskip("chromadb", reason="chroma extra not installed")
+        from zerostack.rag.store import ChromaVectorStore
+
+        store = ChromaVectorStore(path=str(tmp_path / "chroma"), collection="zerostack")
+        store.ensure_collection(64)
+        return store
+
+    def test_upsert_and_search(self, chroma):
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text(
+            "Support agents may issue a refund up to two hundred dollars.", source="a.md"
+        )
+        chroma.upsert(chunks, provider.embed([c.text for c in chunks]))
+        assert chroma.count() == 1
+
+        results = chroma.search(provider.embed_one("refund approval"), top_k=3)
+        assert results
+        assert results[0].source == "a.md"
+        assert "refund" in results[0].text
+
+    def test_source_is_not_duplicated_into_metadata(self, chroma):
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text("refund policy", source="a.md")
+        chroma.upsert(chunks, provider.embed([c.text for c in chunks]))
+        result = chroma.search(provider.embed_one("refund"), top_k=1)[0]
+        assert result.source == "a.md"
+        assert "source" not in result.metadata
+
+    def test_score_threshold_filters(self, chroma):
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text("refund policy", source="a.md")
+        chroma.upsert(chunks, provider.embed([c.text for c in chunks]))
+        assert chroma.search(provider.embed_one("zzz qqq"), top_k=3, score_threshold=0.9) == []
+
+    def test_is_usable_after_reset(self, chroma):
+        provider = HashingEmbeddings(dimensions=64)
+        chunks = chunk_text("refund policy", source="a.md")
+        vectors = provider.embed([c.text for c in chunks])
+        chroma.upsert(chunks, vectors)
+        chroma.reset()
+        assert chroma.count() == 0
+        chroma.upsert(chunks, vectors)
+        assert chroma.count() == 1

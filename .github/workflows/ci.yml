@@ -26,7 +26,10 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # The ui and chroma extras are installed so the Streamlit and Chroma
+          # suites actually run here. Without them they skip, and a skipped test
+          # reports green while covering nothing.
+          pip install -e ".[dev,ui,chroma]"
 
       - name: Lint
         run: |

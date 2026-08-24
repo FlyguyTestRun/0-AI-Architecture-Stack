@@ -69,6 +69,7 @@ class MemoryVectorStore:
     def __init__(self) -> None:
         self._vectors: list[list[float]] = []
         self._chunks: list[Chunk] = []
+        self._dimensions: int | None = None
 
     def ensure_collection(self, dimensions: int) -> None:
         self._dimensions = dimensions
@@ -122,6 +123,11 @@ class QdrantVectorStore:
 
         self.collection = collection
         self.url = url
+        # Remembered so reset() can rebuild the collection. Without it, a reset
+        # store raises "collection not found" on the next upsert, while the
+        # memory and chroma backends stay usable. The protocol has to behave the
+        # same way across implementations or callers cannot switch backends.
+        self._dimensions: int | None = None
         if url in (":memory:", "memory", ""):
             self._client = QdrantClient(location=":memory:")
             self.mode = "in-memory"
@@ -146,6 +152,7 @@ class QdrantVectorStore:
     def ensure_collection(self, dimensions: int) -> None:
         from qdrant_client.models import Distance, VectorParams
 
+        self._dimensions = dimensions
         if self._client.collection_exists(self.collection):
             return
         self._client.create_collection(
@@ -208,8 +215,11 @@ class QdrantVectorStore:
         return int(self._client.count(self.collection, exact=True).count)
 
     def reset(self) -> None:
+        """Empty the collection and leave the store ready for use."""
         if self._client.collection_exists(self.collection):
             self._client.delete_collection(self.collection)
+        if self._dimensions is not None:
+            self.ensure_collection(self._dimensions)
 
 
 class ChromaVectorStore:

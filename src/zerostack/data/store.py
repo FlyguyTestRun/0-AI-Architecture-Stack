@@ -163,7 +163,12 @@ def analytics_summary(sqlite_path: Path | None = None) -> dict[str, Any]:
 
         connection = duckdb.connect()
         connection.execute("INSTALL sqlite; LOAD sqlite;")
-        connection.execute(f"ATTACH '{path}' AS app (TYPE sqlite);")
+        # DuckDB's ATTACH takes no prepared statement parameters, so the path
+        # has to be interpolated. Double any single quote first: a path such as
+        # "/home/o'brien/app.db" would otherwise terminate the string literal
+        # early and raise a parser error.
+        escaped = str(path).replace("'", "''")
+        connection.execute(f"ATTACH '{escaped}' AS app (TYPE sqlite);")
         rows = connection.execute(
             """
             SELECT orchestrator,

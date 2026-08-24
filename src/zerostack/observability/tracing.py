@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -77,14 +79,32 @@ class Span:
         }
 
 
+class _TraceState(threading.local):
+    """Per thread trace id and span stack.
+
+    The tracer is a process wide singleton, but the API serves each request on a
+    worker thread. Holding the current trace id and the open span stack on the
+    instance would let concurrent requests overwrite each other's trace id and
+    parent spans, which silently misattributes spans to the wrong request and
+    stores the wrong trace_id on the run record. Thread local state keeps each
+    request's trace independent.
+    """
+
+    def __init__(self) -> None:
+        self.trace_id = uuid.uuid4().hex
+        self.stack: list[Span] = []
+
+
 class Tracer:
     """Records spans to a JSONL file and optionally to a Phoenix collector."""
 
     def __init__(self, settings: ObservabilitySettings | None = None) -> None:
         self.settings = settings or get_settings().observability
-        self.spans: list[Span] = []
-        self._stack: list[Span] = []
-        self._trace_id = uuid.uuid4().hex
+        # Bounded so a long running server cannot grow this without limit. The
+        # JSONL log is the durable record; this buffer only serves the UI.
+        self.spans: deque[Span] = deque(maxlen=self.settings.max_retained_spans)
+        self._state = _TraceState()
+        self._lock = threading.Lock()
         self._otel_tracer = self._maybe_build_otel_tracer()
 
     def _maybe_build_otel_tracer(self) -> Any | None:
@@ -109,22 +129,29 @@ class Tracer:
         trace.set_tracer_provider(provider)
         return trace.get_tracer("zerostack")
 
+    @property
+    def trace_id(self) -> str:
+        """The trace id for the calling thread."""
+        return self._state.trace_id
+
     def new_trace(self) -> str:
-        """Start a fresh trace id. Call once per user request."""
-        self._trace_id = uuid.uuid4().hex
-        return self._trace_id
+        """Start a fresh trace id for the calling thread. Call once per request."""
+        self._state.trace_id = uuid.uuid4().hex
+        self._state.stack.clear()
+        return self._state.trace_id
 
     @contextmanager
     def span(self, name: str, **attributes: Any) -> Iterator[Span]:
         """Record a span around a block of work."""
+        stack = self._state.stack
         span = Span(
             name=name,
-            trace_id=self._trace_id,
+            trace_id=self._state.trace_id,
             span_id=uuid.uuid4().hex[:16],
-            parent_id=self._stack[-1].span_id if self._stack else None,
+            parent_id=stack[-1].span_id if stack else None,
             attributes=dict(attributes),
         )
-        self._stack.append(span)
+        stack.append(span)
         try:
             yield span
         except Exception as exc:
@@ -132,8 +159,9 @@ class Tracer:
             raise
         finally:
             span.end_time = time.time()
-            self._stack.pop()
-            self.spans.append(span)
+            stack.pop()
+            with self._lock:
+                self.spans.append(span)
             self._emit(span)
 
     def _emit(self, span: Span) -> None:
@@ -162,9 +190,19 @@ class Tracer:
         except Exception as exc:
             logger.warning("trace export failed: %s", exc)
 
-    def summary(self) -> list[dict[str, Any]]:
-        """Return the recorded spans as plain dictionaries."""
-        return [span.to_dict() for span in self.spans]
+    def summary(self, trace_id: str | None = None) -> list[dict[str, Any]]:
+        """Return recorded spans as plain dictionaries.
+
+        Defaults to the calling thread's current trace so a caller asking for
+        "the last run" does not receive every span the process has ever emitted.
+        Pass ``trace_id=""`` to get the whole retained buffer.
+        """
+        wanted = self._state.trace_id if trace_id is None else trace_id
+        with self._lock:
+            spans = list(self.spans)
+        if not wanted:
+            return [span.to_dict() for span in spans]
+        return [span.to_dict() for span in spans if span.trace_id == wanted]
 
 
 _TRACER: Tracer | None = None

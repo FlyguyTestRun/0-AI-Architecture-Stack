@@ -35,24 +35,13 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | CLAUDE.md, six modes, five ADRs |
-| Test suite | VALIDATED | 105 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 142 tests, no network, no Docker, no model server |
 
 ---
 
 ## Next up
 
-### 1. Streamlit smoke test, PLANNED
-
-The Streamlit app is the only component with no automated coverage. A regression in
-it currently ships silently.
-
-- Add a test that imports the module with a stubbed `streamlit` and asserts it builds
-  without error, or drive it with `streamlit.testing.v1.AppTest`.
-- Wire it into `make check`.
-
-Acceptance: a broken Streamlit app fails CI.
-
-### 2. Model driven tool selection, PLANNED
+### 1. Model driven tool selection, PLANNED
 
 Tool selection is rule based today. It is deterministic and testable, but it does not
 generalise past arithmetic and clock reads.
@@ -63,7 +52,7 @@ generalise past arithmetic and clock reads.
 
 Acceptance: a question needing an MCP tool selects it without a hand written rule.
 
-### 3. Reranking, PLANNED
+### 2. Reranking, PLANNED
 
 The relevance ratio cutoff is crude. A cross encoder reranker over the top k would
 materially improve precision.
@@ -74,7 +63,7 @@ materially improve precision.
 Acceptance: retrieval precision improves on a fixed question set, offline path
 unchanged.
 
-### 4. Streaming responses, PLANNED
+### 3. Streaming responses, PLANNED
 
 `LLMClient.complete` is synchronous and returns a whole response. A chat UI needs
 tokens as they arrive.
@@ -85,7 +74,7 @@ tokens as they arrive.
 
 Acceptance: the Streamlit app renders tokens incrementally against Ollama.
 
-### 5. Authentication, BLOCKED
+### 4. Authentication, BLOCKED
 
 Blocked on a decision: is the first deployment single tenant or multi tenant? The
 answer changes the data model, not just the middleware.
@@ -97,7 +86,7 @@ answer changes the data model, not just the middleware.
 Do not start until that is settled. Retrofitting tenancy is far more expensive than
 building it in.
 
-### 6. Next.js frontend, PLANNED
+### 5. Next.js frontend, PLANNED
 
 The API exists for this. Deferred until a project needs a client facing UI.
 
@@ -111,16 +100,40 @@ Recorded rather than hidden.
 
 | Gap | Impact | Mitigation |
 |-----|--------|------------|
-| Streamlit app untested | A regression ships silently | Task 1 above |
 | CrewAI engine untested in CI | Needs a live model server | Structurally correct, unverified end to end. Verify before using it on a project |
 | Embedded Qdrant locks its directory | Two local processes conflict | Second process degrades to in process, documented in RUNBOOK |
 | Hashing embeddings are lexical | Offline retrieval misses synonyms | Install the `embeddings` extra |
 | No rate limiting on the API | An open deployment can be exhausted | Add before any public exposure |
-| No multi tenancy | One deployment serves one customer | Task 5 above |
+| No multi tenancy | One deployment serves one customer | Task 4 above |
 
 ---
 
 ## Change log
+
+### 2026-08-24, later
+
+Bug hunt against the surfaces the first pass did not cover. Six defects found and
+fixed, each with a regression test:
+
+- The tracer held the current trace id and open span stack on the instance, so
+  concurrent API requests overwrote each other. Spans were misattributed and the
+  wrong `trace_id` was written to the run record. Now thread local.
+- The tracer retained every span for the life of the process, a memory leak in a
+  long running server. Now bounded by `max_retained_spans`, default 1000.
+- `last_trace()` returned every span ever recorded rather than the last run's.
+  `summary()` now scopes to the current trace.
+- `QdrantVectorStore.reset()` deleted the collection without recreating it, so the
+  next upsert raised "collection not found" while the memory and chroma backends
+  stayed usable. Backends must behave alike or they are not swappable.
+- A negative `chunk_overlap` was accepted and silently dropped most of the
+  document, roughly 80 percent in the observed case. Now rejected.
+- The DuckDB `ATTACH` interpolated the database path into SQL, breaking on any
+  path containing a quote. Now escaped. DuckDB's `ATTACH` accepts no prepared
+  statement parameters, so escaping is the available fix.
+
+Also closed two coverage gaps: the Streamlit app is now driven by `AppTest`, and
+Chroma has its own suite. Both extras are installed in CI so neither skips. The
+Streamlit app no longer uses the deprecated `use_container_width`.
 
 ### 2026-08-24
 

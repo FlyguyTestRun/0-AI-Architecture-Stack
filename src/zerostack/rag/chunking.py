@@ -33,6 +33,13 @@ def chunk_text(
     metadata: dict[str, Any] | None = None,
 ) -> list[Chunk]:
     """Split ``text`` into overlapping chunks of roughly ``chunk_size`` characters."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    # A negative overlap turns the window step into a stride larger than the
+    # window, which silently skips the text between windows instead of
+    # overlapping it. Reject it rather than lose the document.
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must not be negative")
     if chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be smaller than chunk_size")
 
