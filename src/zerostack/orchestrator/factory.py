@@ -12,19 +12,34 @@ from zerostack.orchestrator.simple import SimpleOrchestrator
 logger = logging.getLogger(__name__)
 
 
+# The module each engine actually imports, not the top level distribution name.
+# "langgraph" is a namespace package: langgraph-checkpoint, langgraph-sdk and
+# langgraph-prebuilt are separate distributions that arrive as transitive
+# dependencies and make the "langgraph" namespace resolve on their own. Probing
+# the namespace therefore reports the engine as available when importing
+# langgraph.graph would still fail, which makes `zerostack doctor` lie about what
+# is installed.
+_ENGINE_MODULES = {
+    "langgraph": "langgraph.graph",
+    "crewai": "crewai",
+}
+
+
 def _installed(module: str) -> bool:
     try:
         return importlib.util.find_spec(module) is not None
-    except (ImportError, ValueError):
+    except (ImportError, AttributeError, ValueError):
+        # find_spec raises rather than returning None when a parent package is
+        # missing or is not a package at all.
         return False
 
 
 def available_engines() -> dict[str, bool]:
-    """Report which engines can be constructed on this machine."""
+    """Report which engines can actually be constructed on this machine."""
     return {
         "simple": True,
-        "langgraph": _installed("langgraph"),
-        "crewai": _installed("crewai"),
+        "langgraph": _installed(_ENGINE_MODULES["langgraph"]),
+        "crewai": _installed(_ENGINE_MODULES["crewai"]),
     }
 
 
@@ -54,7 +69,7 @@ def build_orchestrator(
         return LangGraphOrchestrator(context)
 
     # auto
-    if _installed("langgraph"):
+    if _installed(_ENGINE_MODULES["langgraph"]):
         try:
             from zerostack.orchestrator.langgraph_engine import LangGraphOrchestrator
 

@@ -72,6 +72,15 @@ jobs:
         if: matrix.engine == 'langgraph'
         run: pip install -e ".[langgraph]"
 
+      - name: Test on ${{ matrix.engine }}
+        # The suite runs here as well as in the test job. The LangGraph parity
+        # test, which asserts both engines return the same answer, sources and
+        # steps, skips when LangGraph is absent. Without this step it never ran
+        # anywhere and the central claim of ADR ZS-003 went unverified.
+        env:
+          ZEROSTACK_ORCHESTRATOR_KIND: ${{ matrix.engine }}
+        run: pytest -q -rs
+
       - name: Run the demo on ${{ matrix.engine }}
         env:
           ZEROSTACK_ORCHESTRATOR_KIND: ${{ matrix.engine }}

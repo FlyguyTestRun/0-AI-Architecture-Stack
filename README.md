@@ -256,7 +256,7 @@ src/zerostack/
 apps/streamlit_app/     Layer 1 frontend
 docs/adr/               Architecture decision records
 modes/                  Operational mode definitions
-tests/                  142 tests, no services required
+tests/                  147 tests, no services required
 ```
 
 ---

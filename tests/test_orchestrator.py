@@ -117,3 +117,57 @@ class TestFactory:
         assert graph.answer == simple.answer
         assert graph.sources == simple.sources
         assert [s.name for s in graph.steps] == [s.name for s in simple.steps]
+
+
+class TestEngineDetection:
+    """Engine detection must reflect what can actually be imported.
+
+    "langgraph" is a namespace package. langgraph-checkpoint, langgraph-sdk and
+    langgraph-prebuilt are separate distributions that arrive as transitive
+    dependencies and make the namespace resolve on their own, so probing
+    "langgraph" reported the engine as available while importing langgraph.graph
+    still failed. That made `zerostack doctor` report a backend the process could
+    not build.
+    """
+
+    def test_simple_is_always_reported_available(self):
+        assert available_engines()["simple"] is True
+
+    def test_detection_probes_the_imported_module(self):
+        from zerostack.orchestrator.factory import _ENGINE_MODULES
+
+        # Probing the bare namespace is what caused the false positive.
+        assert _ENGINE_MODULES["langgraph"] == "langgraph.graph"
+
+    def test_a_namespace_without_the_engine_reports_unavailable(self, monkeypatch):
+        import zerostack.orchestrator.factory as factory
+
+        def only_namespace(module: str):
+            if module == "langgraph.graph":
+                return None
+            return object()
+
+        monkeypatch.setattr(factory.importlib.util, "find_spec", only_namespace)
+        assert factory.available_engines()["langgraph"] is False
+
+    def test_detection_survives_a_raising_find_spec(self, monkeypatch):
+        """find_spec raises when a parent package is missing or is not a package."""
+        import zerostack.orchestrator.factory as factory
+
+        def boom(module: str):
+            raise ModuleNotFoundError(module)
+
+        monkeypatch.setattr(factory.importlib.util, "find_spec", boom)
+        engines = factory.available_engines()
+        assert engines["langgraph"] is False
+        assert engines["crewai"] is False
+        assert engines["simple"] is True
+
+    def test_auto_falls_back_when_the_engine_cannot_be_built(self, context, monkeypatch):
+        """A false positive must degrade to simple, never crash a request."""
+        import zerostack.orchestrator.factory as factory
+
+        monkeypatch.setattr(factory, "_installed", lambda module: True)
+        orchestrator = build_orchestrator(context, OrchestratorSettings(kind="auto"))
+        assert orchestrator.name in {"simple", "langgraph"}
+        assert orchestrator.run("When does coverage begin?").answer

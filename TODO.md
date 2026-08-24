@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | CLAUDE.md, six modes, five ADRs |
-| Test suite | VALIDATED | 142 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 147 tests, no network, no Docker, no model server |
 
 ---
 
@@ -130,6 +130,19 @@ fixed, each with a regression test:
 - The DuckDB `ATTACH` interpolated the database path into SQL, breaking on any
   path containing a quote. Now escaped. DuckDB's `ATTACH` accepts no prepared
   statement parameters, so escaping is the available fix.
+
+Two further findings from checking that the new tests actually ran in CI rather
+than skipping:
+
+- Engine detection probed the `langgraph` namespace package. `langgraph-checkpoint`,
+  `langgraph-sdk` and `langgraph-prebuilt` are separate distributions that arrive as
+  transitive dependencies and make that namespace resolve on their own, so
+  `zerostack doctor` reported LangGraph as available while importing
+  `langgraph.graph` still failed. Detection now probes the module actually imported.
+- The orchestrator matrix job ran only `zerostack demo`, never `pytest`. The
+  LangGraph parity test skips when LangGraph is absent, so it ran nowhere and the
+  central claim of ADR ZS-003 went unverified in CI. The matrix job now runs the
+  suite.
 
 Also closed two coverage gaps: the Streamlit app is now driven by `AppTest`, and
 Chroma has its own suite. Both extras are installed in CI so neither skips. The
