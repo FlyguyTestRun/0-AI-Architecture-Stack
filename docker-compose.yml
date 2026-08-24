@@ -1,0 +1,64 @@
+# The $0 infrastructure tier. Every service here is free and self hosted.
+#
+# Start everything:      docker compose up -d
+# Start only the vector db:  docker compose up -d qdrant
+#
+# The application detects each service at startup and falls back when one is absent,
+# so partial stacks are supported on purpose.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: zerostack-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    healthcheck:
+      # Qdrant images ship no curl, so probe the port from Qdrant's own binary host.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: zerostack-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Uncomment on a machine with an NVIDIA GPU.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  phoenix:
+    image: arizephoenix/phoenix:version-5.9.0
+    container_name: zerostack-phoenix
+    restart: unless-stopped
+    ports:
+      - "6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /data
+    volumes:
+      - phoenix-data:/data
+
+volumes:
+  qdrant-storage:
+  ollama-models:
+  phoenix-data:

@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to mcp.json to register MCP servers with the tool layer. Requires the 'mcp' package: pip install mcp",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./data"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "set-this-in-your-shell-not-in-this-file"
+      }
+    }
+  }
+}
