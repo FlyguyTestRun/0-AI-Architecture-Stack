@@ -21,6 +21,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = REPO_ROOT / "data"
 
+# Every section reads the same dotenv file. The nested sections are built by
+# default_factory, which constructs them independently of the outer Settings, so
+# without this they would read only the process environment. The documented
+# "copy .env.example to .env" flow would then appear to do nothing: a deployment
+# could set a provider explicitly and still silently get the offline fallback.
+_DOTENV = ".env"
+
 LLMProvider = Literal["auto", "ollama", "echo"]
 VectorBackend = Literal["auto", "qdrant", "chroma", "memory"]
 EmbeddingBackend = Literal["auto", "sentence-transformers", "hashing"]
@@ -30,7 +37,9 @@ OrchestratorKind = Literal["auto", "langgraph", "crewai", "simple"]
 class LLMSettings(BaseSettings):
     """Layer 4: the LLM layer."""
 
-    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_LLM_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_LLM_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
 
     provider: LLMProvider = "auto"
     model: str = "gemma3:4b"
@@ -43,7 +52,9 @@ class LLMSettings(BaseSettings):
 class RAGSettings(BaseSettings):
     """Layer 3: the RAG pipeline."""
 
-    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_RAG_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_RAG_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
 
     backend: VectorBackend = "auto"
     embedding_backend: EmbeddingBackend = "auto"
@@ -72,7 +83,12 @@ class RAGSettings(BaseSettings):
 class OrchestratorSettings(BaseSettings):
     """Layer 2: the agent orchestrator."""
 
-    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_ORCHESTRATOR_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_ORCHESTRATOR_",
+        env_file=_DOTENV,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     kind: OrchestratorKind = "auto"
     max_steps: int = 6
@@ -82,7 +98,9 @@ class OrchestratorSettings(BaseSettings):
 class DataSettings(BaseSettings):
     """Layer 7: the data layer."""
 
-    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_DATA_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_DATA_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
 
     sqlite_path: Path = DEFAULT_DATA_DIR / "zerostack.db"
     duckdb_path: Path = DEFAULT_DATA_DIR / "analytics.duckdb"
@@ -93,7 +111,9 @@ class DataSettings(BaseSettings):
 class ObservabilitySettings(BaseSettings):
     """The cross cutting observability layer."""
 
-    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_OBS_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_OBS_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
 
     enabled: bool = True
     phoenix_endpoint: str = "http://localhost:6006/v1/traces"

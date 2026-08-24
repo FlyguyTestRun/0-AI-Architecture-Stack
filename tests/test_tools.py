@@ -102,3 +102,37 @@ class TestMCPAdapter:
         path.write_text(json.dumps({"mcpServers": {"broken": {}}}), encoding="utf-8")
         assert load_mcp_config(path) == {"broken": {}}
         assert discover_mcp_tools(path) == []
+
+
+class TestCalculatorBounds:
+    """Expression text can come from a retrieved document, so its size is untrusted."""
+
+    def test_an_over_long_expression_is_rejected(self):
+        result = calculate("+".join(["1"] * 20000))
+        assert result.ok is False
+        assert "exceeds" in result.error
+
+    def test_rejection_happens_before_parsing(self):
+        """Parsing a long expression is what exhausts the stack, so the length
+        check has to come first rather than catching the fallout."""
+        from zerostack.tools.builtin import MAX_EXPRESSION_LENGTH
+
+        result = calculate("1" + "+1" * MAX_EXPRESSION_LENGTH)
+        assert result.ok is False
+        assert "exceeds" in result.error
+
+    def test_deeply_nested_input_does_not_escape_as_an_exception(self):
+        result = calculate("(" * 120 + "1" + ")" * 120)
+        assert isinstance(result.ok, bool)
+
+    def test_an_expression_at_the_limit_still_evaluates(self):
+        from zerostack.tools.builtin import MAX_EXPRESSION_LENGTH
+
+        expression = "1" + "+1" * ((MAX_EXPRESSION_LENGTH - 10) // 2)
+        result = calculate(expression)
+        assert result.ok is True
+
+    def test_overflow_is_reported_not_raised(self):
+        result = calculate("9 ** 9 ** 9")
+        assert result.ok is False
+        assert result.error

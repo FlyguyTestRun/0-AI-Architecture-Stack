@@ -324,3 +324,51 @@ class TestChromaBackend:
         assert chroma.count() == 0
         chroma.upsert(chunks, vectors)
         assert chroma.count() == 1
+
+
+class TestSourceUniqueness:
+    """Two files sharing a basename must not overwrite each other.
+
+    Chunk ids derive from the source, so using the bare filename meant
+    hr/policy.md and legal/policy.md collided and the second silently replaced
+    the first. A company document tree almost always has repeated filenames, so
+    this lost documents in the most ordinary case there is.
+    """
+
+    @pytest.fixture
+    def nested_corpus(self, tmp_path):
+        for team, text in (
+            ("hr", "HR policy: staff receive twenty vacation days per year."),
+            ("legal", "Legal policy: contracts require two signatures over fifty thousand."),
+            ("finance", "Finance policy: expenses over five hundred need director approval."),
+        ):
+            (tmp_path / team).mkdir()
+            (tmp_path / team / "policy.md").write_text(text, encoding="utf-8")
+        return tmp_path
+
+    def test_all_documents_survive_ingestion(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        report = rag.ingest_path(nested_corpus)
+        assert report.files == 3
+        assert rag.store.count() == 3
+
+    def test_sources_are_paths_relative_to_the_root(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus)
+        sources = {result.source for result in rag.retrieve("policy", top_k=10)}
+        assert sources == {"hr/policy.md", "legal/policy.md", "finance/policy.md"}
+
+    def test_each_document_is_independently_retrievable(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus)
+        assert "vacation" in rag.retrieve("vacation days", top_k=1)[0].text
+        assert "signatures" in rag.retrieve("contracts signatures", top_k=1)[0].text
+
+    def test_a_single_file_keeps_its_basename(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus / "hr" / "policy.md")
+        assert rag.retrieve("vacation", top_k=1)[0].source == "policy.md"

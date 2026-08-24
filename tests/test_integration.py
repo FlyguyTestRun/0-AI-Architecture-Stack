@@ -149,3 +149,48 @@ class TestConfiguration:
         settings.ensure_directories()
         settings.ensure_directories()
         assert settings.data.sqlite_path.parent.exists()
+
+
+class TestDotenvLoading:
+    """The documented flow is to copy .env.example to .env and edit it.
+
+    Each settings section is built by its own default_factory, independently of
+    the outer Settings object, so each has to read the dotenv file itself. When
+    only the outer object read it, the documented flow appeared to do nothing: a
+    deployment could name a provider explicitly and still silently run on the
+    offline fallback.
+    """
+
+    @pytest.fixture
+    def dotenv_dir(self, tmp_path, monkeypatch):
+        (tmp_path / ".env").write_text(
+            "ZEROSTACK_LLM_PROVIDER=ollama\n"
+            "ZEROSTACK_LLM_MODEL=custom-model\n"
+            "ZEROSTACK_RAG_TOP_K=11\n"
+            "ZEROSTACK_ORCHESTRATOR_KIND=simple\n"
+            "ZEROSTACK_OBS_LOG_LEVEL=WARNING\n",
+            encoding="utf-8",
+        )
+        for name in list(os.environ):
+            if name.startswith("ZEROSTACK_"):
+                monkeypatch.delenv(name, raising=False)
+        monkeypatch.chdir(tmp_path)
+        return tmp_path
+
+    def test_llm_section_reads_dotenv(self, dotenv_dir):
+        settings = Settings()
+        assert settings.llm.provider == "ollama"
+        assert settings.llm.model == "custom-model"
+
+    def test_rag_section_reads_dotenv(self, dotenv_dir):
+        assert Settings().rag.top_k == 11
+
+    def test_orchestrator_section_reads_dotenv(self, dotenv_dir):
+        assert Settings().orchestrator.kind == "simple"
+
+    def test_observability_section_reads_dotenv(self, dotenv_dir):
+        assert Settings().observability.log_level == "WARNING"
+
+    def test_process_environment_still_wins_over_dotenv(self, dotenv_dir, monkeypatch):
+        monkeypatch.setenv("ZEROSTACK_LLM_PROVIDER", "echo")
+        assert Settings().llm.provider == "echo"

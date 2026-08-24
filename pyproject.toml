@@ -18,7 +18,9 @@ dependencies = [
   "rich>=13.7",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.29",
-  "qdrant-client>=1.9",
+  # query_points was introduced in 1.10; 1.9 exposes only the older search API,
+# so retrieval would fail with AttributeError against the older floor.
+  "qdrant-client>=1.10",
   "duckdb>=0.10",
   "python-dotenv>=1.0",
 ]

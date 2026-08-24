@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | AGENTS.md, six modes, five ADRs |
-| Test suite | VALIDATED | 162 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 176 tests, no network, no Docker, no model server |
 
 ---
 
@@ -110,6 +110,32 @@ Recorded rather than hidden.
 ---
 
 ## Change log
+
+### 2026-08-24, fourth pass
+
+Four findings from an automated review on the merged pull request, each verified
+independently before acting. Two were correct and serious, one was correct, and one
+did not reproduce as described but pointed at a real defect next to it.
+
+- **Configuration silently ignored.** Each settings section is built by its own
+  factory, independently of the outer object, so only the outer object read the
+  dotenv file. The documented "copy .env.example to .env" flow therefore did
+  nothing: a deployment could name a provider explicitly and still run on the
+  offline fallback with no warning. Every section now reads it.
+- **Documents silently lost on ingestion.** Chunk ids derive from the source, and
+  the source was the bare filename, so `hr/policy.md` and `legal/policy.md`
+  collided and the second replaced the first. Verified: two distinct files went in,
+  one came out. Sources are now paths relative to the ingest root. A company
+  document tree almost always repeats filenames, so this was the ordinary case
+  rather than an edge case.
+- **Dependency floor too low.** `query_points` arrived in qdrant-client 1.10, but
+  the floor allowed 1.9, which exposes only the older `search` API. A resolve to
+  the floor would ingest happily and then fail every retrieval. Floor raised.
+- **Unbounded expression evaluation.** The reported integer exponentiation attack
+  does not reproduce, because operands are cast to float and overflow immediately.
+  Probing it did surface a real one: a long expression raised an uncaught
+  `RecursionError` during parsing. Expression length is now capped before parsing,
+  and stack and memory exhaustion are reported as bad input rather than escaping.
 
 ### 2026-08-24, third pass
 

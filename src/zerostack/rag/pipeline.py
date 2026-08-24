@@ -134,7 +134,17 @@ class RAGPipeline:
                     report.skipped.append(str(file_path))
                     continue
 
-                count = self.ingest_text(content, source=file_path.name)
+                # The source must be unique across the tree. Using the bare
+                # filename meant hr/policy.md and legal/policy.md produced the
+                # same chunk id, so the second silently overwrote the first and
+                # a document disappeared from the index without any error.
+                try:
+                    source = (
+                        file_path.relative_to(path).as_posix() if path.is_dir() else file_path.name
+                    )
+                except ValueError:
+                    source = file_path.name
+                count = self.ingest_text(content, source=source)
                 if count:
                     report.files += 1
                     report.chunks += count
