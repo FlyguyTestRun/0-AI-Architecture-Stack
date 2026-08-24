@@ -72,9 +72,39 @@ class ZerostackApp:
 
         return result
 
-    def ingest(self, path: Path | str | None = None) -> dict[str, Any]:
-        """Ingest a file or directory into the vector store."""
+    def allowed_ingest_roots(self) -> list[Path]:
+        """Directories an untrusted caller may ingest from."""
+        configured = self.settings.rag.allowed_ingest_roots
+        roots = list(configured) if configured else [self.settings.rag.corpus_dir]
+        return [root.expanduser().resolve() for root in roots]
+
+    def _check_ingest_allowed(self, target: Path) -> None:
+        """Reject a path outside the allowed roots.
+
+        Without this, any caller who can reach the ingest endpoint can index an
+        arbitrary readable directory and then read its contents back out through
+        the ask endpoint, which turns a document tool into arbitrary file
+        disclosure. Resolving first collapses traversal segments and symlinks, so
+        the comparison cannot be walked around with "..".
+        """
+        resolved = target.expanduser().resolve()
+        roots = self.allowed_ingest_roots()
+        if not any(resolved == root or root in resolved.parents for root in roots):
+            raise PermissionError(
+                f"{resolved} is outside the allowed ingest roots. "
+                f"Allowed: {', '.join(str(root) for root in roots)}. "
+                "Set ZEROSTACK_RAG_ALLOWED_INGEST_ROOTS to widen this."
+            )
+
+    def ingest(self, path: Path | str | None = None, enforce_roots: bool = True) -> dict[str, Any]:
+        """Ingest a file or directory into the vector store.
+
+        ``enforce_roots`` defaults to True so that every caller is restricted
+        unless it deliberately opts out. The CLI opts out; the API does not.
+        """
         target = Path(path) if path else self.settings.rag.corpus_dir
+        if enforce_roots:
+            self._check_ingest_allowed(target)
         if not target.exists():
             raise FileNotFoundError(f"nothing to ingest at {target}")
         report = self.rag.ingest_path(target)

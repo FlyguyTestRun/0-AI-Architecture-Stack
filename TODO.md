@@ -34,8 +34,8 @@
 | Typer CLI | VALIDATED | doctor, ingest, ask, demo, runs, analytics, serve |
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
-| Governance docs and ADRs | VALIDATED | CLAUDE.md, six modes, five ADRs |
-| Test suite | VALIDATED | 148 tests, no network, no Docker, no model server |
+| Governance docs and ADRs | VALIDATED | AGENTS.md, six modes, five ADRs |
+| Test suite | VALIDATED | 162 tests, no network, no Docker, no model server |
 
 ---
 
@@ -104,11 +104,33 @@ Recorded rather than hidden.
 | Embedded Qdrant locks its directory | Two local processes conflict | Second process degrades to in process, documented in RUNBOOK |
 | Hashing embeddings are lexical | Offline retrieval misses synonyms | Install the `embeddings` extra |
 | No rate limiting on the API | An open deployment can be exhausted | Add before any public exposure |
+| No authentication on the API | Anyone who can reach it can query the corpus | Ingest is bounded to an allowlist, but auth is still required before exposure |
 | No multi tenancy | One deployment serves one customer | Task 4 above |
 
 ---
 
 ## Change log
+
+### 2026-08-24, third pass
+
+Security finding, the most serious of the session. The ingest endpoint accepted any
+filesystem path from the caller, so anyone who could reach the API could index an
+arbitrary readable directory and then read its contents back out through the ask
+endpoint. Verified end to end by planting a credentials file outside the corpus and
+retrieving its contents through a question. That is path traversal plus information
+disclosure in one step.
+
+Ingest is now restricted to a configured allowlist of roots, defaulting to the corpus
+directory. Paths are resolved before comparison so traversal segments and symlinks
+cannot walk around it, and the boundary is checked before existence so a caller
+cannot probe the filesystem for what exists. The CLI opts out deliberately, since an
+operator with shell access can already read those files. Twelve tests cover the
+boundary, including the end to end exfiltration path.
+
+Also removed every vendor product name from the repository, renamed the operating
+rules file to the vendor neutral `AGENTS.md`, generalized the pre-commit attribution
+check to match by shape rather than by brand, and rewrote the README as a dual
+audience document with a purpose statement, an honest fit critique, and a growth path.
 
 ### 2026-08-24, later
 

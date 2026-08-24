@@ -53,8 +53,13 @@ class TestOfflineFirstRun:
         with pytest.raises(ValueError):
             app.ask("   ")
 
-    def test_ingesting_a_missing_path_raises(self, app):
+    def test_ingesting_a_missing_path_inside_the_root_raises(self, app):
         with pytest.raises(FileNotFoundError):
+            app.ingest(app.settings.rag.corpus_dir / "absent.md")
+
+    def test_ingesting_outside_the_root_is_refused_before_existence(self, app):
+        """The boundary answers first, so a caller cannot probe for what exists."""
+        with pytest.raises(PermissionError):
             app.ingest("/does/not/exist")
 
 

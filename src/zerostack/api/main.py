@@ -93,6 +93,10 @@ def ingest(request: IngestRequest) -> dict[str, Any]:
     """Index documents into the vector store."""
     try:
         return get_app().ingest(request.path)
+    except PermissionError as exc:
+        # The path is outside the configured roots. Refusing is the whole point,
+        # so this is a 403 rather than a server error.
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

@@ -22,6 +22,8 @@ Autonomy: medium. Questions: some. Rules: tight.
 - [ ] Dependencies checked for known advisories
 - [ ] Error messages leak no internal paths or credentials
 - [ ] Prompt injection considered for every new context path
+- [ ] Any endpoint taking a filesystem path, URL, or identifier is bounded to an
+      allowlist, resolved before comparison, and checked before existence
 
 ## Exit criteria
 

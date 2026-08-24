@@ -11,11 +11,15 @@ from zerostack.app import ZerostackApp
 
 
 @pytest.fixture
-def client(settings, monkeypatch, corpus_dir):
-    """A test client backed by a fully offline application instance."""
+def app(settings, corpus_dir) -> ZerostackApp:
     settings.rag.corpus_dir = corpus_dir
-    instance = ZerostackApp(settings=settings, include_mcp=False)
-    monkeypatch.setattr(api_module, "_app_instance", instance)
+    return ZerostackApp(settings=settings, include_mcp=False)
+
+
+@pytest.fixture
+def client(app, monkeypatch):
+    """A test client backed by a fully offline application instance."""
+    monkeypatch.setattr(api_module, "_app_instance", app)
     with TestClient(api) as test_client:
         yield test_client
 
@@ -60,9 +64,17 @@ class TestIngest:
         assert body["files"] == 2
         assert body["chunks"] > 0
 
-    def test_missing_path_returns_404(self, client):
-        response = client.post("/ingest", json={"path": "/does/not/exist"})
-        assert response.status_code == 404
+    def test_a_missing_path_inside_the_root_returns_404(self, client, app):
+        target = app.settings.rag.corpus_dir / "absent.md"
+        assert client.post("/ingest", json={"path": str(target)}).status_code == 404
+
+    def test_a_missing_path_outside_the_root_returns_403_not_404(self, client):
+        """Existence is checked after the boundary, never before.
+
+        Returning 404 for an out of bounds path would let a caller probe the
+        filesystem for which paths exist, so the boundary answers first.
+        """
+        assert client.post("/ingest", json={"path": "/does/not/exist"}).status_code == 403
 
 
 class TestRunsAndAnalytics:

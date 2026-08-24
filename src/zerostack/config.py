@@ -62,6 +62,11 @@ class RAGSettings(BaseSettings):
     # is not portable across embedding backends, a relative one is.
     relevance_ratio: float = 0.5
     corpus_dir: Path = DEFAULT_DATA_DIR / "corpus"
+    # Directories the application will ingest from when the caller is untrusted.
+    # Empty means "the corpus directory only". The API enforces this; the CLI does
+    # not, because an operator with shell access can already read these files and
+    # restricting them would add friction without adding safety.
+    allowed_ingest_roots: list[Path] = []
 
 
 class OrchestratorSettings(BaseSettings):

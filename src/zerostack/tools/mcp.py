@@ -6,8 +6,8 @@ each one. This module discovers the tools a configured MCP server publishes and 
 each one as a :class:`~zerostack.tools.base.Tool`, so the orchestrator sees no
 difference between an MCP tool and a built in one.
 
-Servers are declared in ``mcp.json`` at the repository root. The file uses the same
-shape as the Claude Code and Claude Desktop MCP configuration:
+Servers are declared in ``mcp.json`` at the repository root. The file uses the
+conventional MCP client configuration shape, which most MCP capable clients read:
 
     {
       "mcpServers": {

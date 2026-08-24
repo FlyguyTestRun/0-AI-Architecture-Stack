@@ -90,7 +90,10 @@ def ingest(
 ) -> None:
     """Index documents into the vector store."""
     try:
-        report = ZerostackApp().ingest(path)
+        # The operator running this command can already read these files, so the
+        # allowlist that protects the API endpoint would add friction here without
+        # adding safety.
+        report = ZerostackApp().ingest(path, enforce_roots=False)
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from exc

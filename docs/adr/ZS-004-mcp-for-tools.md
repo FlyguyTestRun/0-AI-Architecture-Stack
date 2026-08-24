@@ -12,8 +12,9 @@ recurring cost in this kind of work, and none of it is differentiating.
 ## Decision
 
 The tool layer registers built in tools and MCP discovered tools in one registry with
-one shape. Servers are declared in `mcp.json`, using the same format as Claude Code
-and Claude Desktop, so a server configured for one is configured for all.
+one shape. Servers are declared in `mcp.json`, using the conventional MCP client
+configuration shape, so a server configured once is configured for every client that
+reads it.
 
 The orchestrator resolves tools by name from the registry. It has no idea whether a
 tool is local or remote.
@@ -30,7 +31,7 @@ offline one. Native function calling is a change confined to `tool_node`.
 Good:
 
 - A new integration is a config entry, not a code change.
-- Tool configuration is portable across the Claude tooling the team already uses.
+- Tool configuration is portable across every MCP capable client the team uses.
 - Discovery failures are contained per server: one unreachable server does not stop
   the others registering.
 

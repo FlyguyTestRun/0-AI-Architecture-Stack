@@ -15,7 +15,7 @@ Autonomy: high. Questions: few. Rules: medium.
 ## Constraints
 
 - Never break the offline path. A new hard dependency belongs in an optional extra.
-- Layer boundaries are not negotiable. See `CLAUDE.md`.
+- Layer boundaries are not negotiable. See `AGENTS.md`.
 - `make check` passes before every commit.
 
 ## Exit criteria
