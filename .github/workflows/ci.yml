@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Test on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # The ui and chroma extras are installed so the Streamlit and Chroma
+          # suites actually run here. Without them they skip, and a skipped test
+          # reports green while covering nothing.
+          pip install -e ".[dev,ui,chroma]"
+
+      - name: Lint
+        run: |
+          ruff check src tests apps
+          ruff format --check src tests apps
+
+      - name: Dash policy (ADR GLOBAL-003)
+        run: python scripts/check_emdash.py
+
+      - name: Test
+        # No services are started on purpose. CI exercises the offline fallback
+        # path, which is the path a new contributor hits on a clean clone.
+        run: pytest -q
+
+      - name: Demo smoke test
+        run: zerostack demo
+
+  orchestrator-matrix:
+    name: Orchestrator ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: ["simple", "langgraph"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install LangGraph
+        if: matrix.engine == 'langgraph'
+        run: pip install -e ".[langgraph]"
+
+      - name: Test on ${{ matrix.engine }}
+        # The suite runs here as well as in the test job. The LangGraph parity
+        # test, which asserts both engines return the same answer, sources and
+        # steps, skips when LangGraph is absent. Without this step it never ran
+        # anywhere and the central claim of ADR ZS-003 went unverified.
+        env:
+          ZEROSTACK_ORCHESTRATOR_KIND: ${{ matrix.engine }}
+        run: pytest -q -rs
+
+      - name: Run the demo on ${{ matrix.engine }}
+        env:
+          ZEROSTACK_ORCHESTRATOR_KIND: ${{ matrix.engine }}
+        run: zerostack demo

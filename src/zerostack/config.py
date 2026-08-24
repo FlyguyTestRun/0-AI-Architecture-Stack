@@ -1,0 +1,137 @@
+"""Central configuration for every layer of the stack.
+
+Configuration is read from environment variables (optionally via a .env file) and
+validated once at import time by :func:`get_settings`. Each layer reads only its own
+section, which keeps the layers swappable without a shared global.
+
+Every selector below accepts ``auto``. ``auto`` means "use the best backend that is
+actually available on this machine, otherwise fall back to the offline one". That is
+what allows the reference demo to run on a clean clone with no Docker and no Ollama.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_DIR = REPO_ROOT / "data"
+
+LLMProvider = Literal["auto", "ollama", "echo"]
+VectorBackend = Literal["auto", "qdrant", "chroma", "memory"]
+EmbeddingBackend = Literal["auto", "sentence-transformers", "hashing"]
+OrchestratorKind = Literal["auto", "langgraph", "crewai", "simple"]
+
+
+class LLMSettings(BaseSettings):
+    """Layer 4: the LLM layer."""
+
+    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_LLM_", extra="ignore")
+
+    provider: LLMProvider = "auto"
+    model: str = "gemma3:4b"
+    base_url: str = "http://localhost:11434"
+    temperature: float = 0.2
+    max_tokens: int = 1024
+    timeout_seconds: float = 120.0
+
+
+class RAGSettings(BaseSettings):
+    """Layer 3: the RAG pipeline."""
+
+    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_RAG_", extra="ignore")
+
+    backend: VectorBackend = "auto"
+    embedding_backend: EmbeddingBackend = "auto"
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_dimensions: int = 384
+    qdrant_url: str = "http://localhost:6333"
+    # Where the embedded Qdrant keeps its files when no server is reachable. This is
+    # what makes an index survive between CLI invocations without Docker.
+    qdrant_path: Path = DEFAULT_DATA_DIR / "qdrant"
+    collection: str = "zerostack"
+    chunk_size: int = 800
+    chunk_overlap: int = 120
+    top_k: int = 4
+    score_threshold: float = 0.0
+    # Drop any hit scoring below this fraction of the best hit. An absolute threshold
+    # is not portable across embedding backends, a relative one is.
+    relevance_ratio: float = 0.5
+    corpus_dir: Path = DEFAULT_DATA_DIR / "corpus"
+
+
+class OrchestratorSettings(BaseSettings):
+    """Layer 2: the agent orchestrator."""
+
+    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_ORCHESTRATOR_", extra="ignore")
+
+    kind: OrchestratorKind = "auto"
+    max_steps: int = 6
+    enable_tools: bool = True
+
+
+class DataSettings(BaseSettings):
+    """Layer 7: the data layer."""
+
+    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_DATA_", extra="ignore")
+
+    sqlite_path: Path = DEFAULT_DATA_DIR / "zerostack.db"
+    duckdb_path: Path = DEFAULT_DATA_DIR / "analytics.duckdb"
+    supabase_url: str = ""
+    supabase_key: str = ""
+
+
+class ObservabilitySettings(BaseSettings):
+    """The cross cutting observability layer."""
+
+    model_config = SettingsConfigDict(env_prefix="ZEROSTACK_OBS_", extra="ignore")
+
+    enabled: bool = True
+    phoenix_endpoint: str = "http://localhost:6006/v1/traces"
+    export_traces: bool = False
+    log_level: str = "INFO"
+    trace_log_path: Path = DEFAULT_DATA_DIR / "traces.jsonl"
+    # Caps the in memory span buffer. The JSONL log keeps the full history.
+    max_retained_spans: int = 1000
+
+
+class Settings(BaseSettings):
+    """Top level settings object composed of one section per layer."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    app_name: str = "zerostack"
+    environment: str = Field(default="local", description="local, staging or production")
+
+    llm: LLMSettings = Field(default_factory=LLMSettings)
+    rag: RAGSettings = Field(default_factory=RAGSettings)
+    orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
+    data: DataSettings = Field(default_factory=DataSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+
+    def ensure_directories(self) -> None:
+        """Create the directories the local backends write into."""
+        for path in (
+            self.data.sqlite_path.parent,
+            self.data.duckdb_path.parent,
+            self.observability.trace_log_path.parent,
+            self.rag.corpus_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process wide settings singleton."""
+    settings = Settings()
+    settings.ensure_directories()
+    return settings
+
+
+def reset_settings_cache() -> None:
+    """Clear the settings cache. Used by tests that patch the environment."""
+    get_settings.cache_clear()

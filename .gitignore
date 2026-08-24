@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Testing and tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state produced at runtime
+data/*.db
+data/*.duckdb
+data/traces.jsonl
+data/chroma/
+data/qdrant/
+
+# Environment
+.env
+.env.local
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

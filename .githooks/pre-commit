@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Zerostack pre-commit hook.
+# Enable with: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+echo "pre-commit: checking staged files"
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+# ADR GLOBAL-003: no em dashes in committed text.
+# shellcheck disable=SC2086
+python3 scripts/check_emdash.py $staged || {
+  echo "pre-commit: blocked by the dash policy (ADR GLOBAL-003)"
+  exit 1
+}
+
+# ADR GLOBAL-001: no AI attribution in committed content.
+#
+# The policy files below necessarily quote the strings they forbid, in order to
+# define and enforce the rule. Scanning them would make the hook flag itself, so
+# they are exempt. Everything else is scanned.
+is_policy_file() {
+  case "$1" in
+    CLAUDE.md|.githooks/pre-commit|scripts/check_emdash.py|docs/adr/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+attribution_re='^\+.*(co-authored-by:[[:space:]]*claude|generated (by|with) claude|generated with \[claude)'
+violations=0
+
+for file in $staged; do
+  if is_policy_file "$file"; then
+    continue
+  fi
+  if git diff --cached -- "$file" | grep -qEi "$attribution_re"; then
+    echo "pre-commit: AI attribution found in $file"
+    git diff --cached -- "$file" | grep -nEi "$attribution_re" | head -5
+    violations=$((violations + 1))
+  fi
+done
+
+if [ "$violations" -gt 0 ]; then
+  echo "pre-commit: blocked by the attribution policy (ADR GLOBAL-001)"
+  exit 1
+fi
+
+if [ -x .venv/bin/ruff ]; then
+  .venv/bin/ruff check src tests apps
+fi
+
+echo "pre-commit: ok"
