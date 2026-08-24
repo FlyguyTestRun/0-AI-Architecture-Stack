@@ -110,3 +110,35 @@ class TestOperatorPath:
     def test_enforcement_is_the_default(self, app, secret_dir):
         with pytest.raises(PermissionError):
             app.ingest(secret_dir)
+
+
+class TestRefusalDoesNotDisclose:
+    """A refusal must not become a way to map the filesystem.
+
+    The API forwards the PermissionError text verbatim to an unauthenticated
+    caller, so naming the requested path or the configured roots would let anyone
+    probe for what exists and learn where the corpus lives.
+    """
+
+    def test_403_body_does_not_name_the_configured_roots(self, client, app, secret_dir):
+        detail = client.post("/ingest", json={"path": str(secret_dir)}).json()["detail"]
+        corpus = str(app.settings.rag.corpus_dir)
+        assert corpus not in detail
+        assert str(app.settings.rag.corpus_dir.resolve()) not in detail
+
+    def test_403_body_does_not_echo_the_requested_path(self, client, secret_dir):
+        detail = client.post("/ingest", json={"path": str(secret_dir)}).json()["detail"]
+        assert str(secret_dir) not in detail
+        assert "secrets" not in detail
+
+    def test_403_still_explains_how_to_widen_the_boundary(self, client, secret_dir):
+        detail = client.post("/ingest", json={"path": str(secret_dir)}).json()["detail"]
+        assert "ZEROSTACK_RAG_ALLOWED_INGEST_ROOTS" in detail
+
+    def test_the_operator_can_still_see_the_detail_in_the_log(self, app, secret_dir, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="zerostack.app"):
+            with pytest.raises(PermissionError):
+                app.ingest(secret_dir)
+        assert str(secret_dir.resolve()) in caplog.text

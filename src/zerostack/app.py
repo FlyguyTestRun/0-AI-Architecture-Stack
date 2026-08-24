@@ -90,10 +90,20 @@ class ZerostackApp:
         resolved = target.expanduser().resolve()
         roots = self.allowed_ingest_roots()
         if not any(resolved == root or root in resolved.parents for root in roots):
+            # This message names neither the requested path nor the configured
+            # roots. The API forwards it verbatim to an unauthenticated caller,
+            # so echoing either would turn a refusal into a way to probe the
+            # filesystem and learn where the corpus lives. The detail goes to the
+            # server log, where an operator can see it and a caller cannot.
+            logger.warning(
+                "refused ingest of %s, outside allowed roots %s",
+                resolved,
+                [str(root) for root in roots],
+            )
             raise PermissionError(
-                f"{resolved} is outside the allowed ingest roots. "
-                f"Allowed: {', '.join(str(root) for root in roots)}. "
-                "Set ZEROSTACK_RAG_ALLOWED_INGEST_ROOTS to widen this."
+                "path is outside the allowed ingest roots. See the server log for "
+                "the requested path, and set ZEROSTACK_RAG_ALLOWED_INGEST_ROOTS "
+                "to widen them."
             )
 
     def ingest(self, path: Path | str | None = None, enforce_roots: bool = True) -> dict[str, Any]:

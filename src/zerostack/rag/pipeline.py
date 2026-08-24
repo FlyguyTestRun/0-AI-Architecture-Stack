@@ -102,7 +102,7 @@ class RAGPipeline:
         self.store = store or build_vector_store(self.settings)
         self.store.ensure_collection(self.embeddings.dimensions)
 
-    def ingest_text(self, text: str, source: str, **metadata: object) -> int:
+    def ingest_text(self, text: str, source: str, source_id: str = "", **metadata: object) -> int:
         """Chunk, embed and upsert a single document. Returns the chunk count."""
         chunks = chunk_text(
             text,
@@ -110,8 +110,24 @@ class RAGPipeline:
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap,
             metadata=dict(metadata),
+            source_id=source_id,
         )
         return self._upsert(chunks)
+
+    def _display_source(self, file_path: Path, target: Path) -> str:
+        """A short, readable name for citations.
+
+        Preference order is the corpus root, then the ingest target, then the bare
+        filename, so a file under the configured corpus keeps the same citation
+        however the caller reached it.
+        """
+        candidates = [self.settings.corpus_dir, target if target.is_dir() else target.parent]
+        for root in candidates:
+            try:
+                return file_path.resolve().relative_to(root.resolve()).as_posix()
+            except (ValueError, OSError):
+                continue
+        return file_path.name
 
     def ingest_path(self, path: Path) -> IngestReport:
         """Ingest a file, or every supported text file under a directory."""
@@ -134,17 +150,16 @@ class RAGPipeline:
                     report.skipped.append(str(file_path))
                     continue
 
-                # The source must be unique across the tree. Using the bare
-                # filename meant hr/policy.md and legal/policy.md produced the
-                # same chunk id, so the second silently overwrote the first and
-                # a document disappeared from the index without any error.
-                try:
-                    source = (
-                        file_path.relative_to(path).as_posix() if path.is_dir() else file_path.name
-                    )
-                except ValueError:
-                    source = file_path.name
-                count = self.ingest_text(content, source=source)
+                # Identity is the resolved absolute path, so the same file gets
+                # the same chunk id no matter which directory the caller passed.
+                # Making identity relative to the ingest argument was not enough:
+                # ingesting two sibling directories separately still collided, and
+                # ingesting a parent then a child left a stale duplicate behind.
+                count = self.ingest_text(
+                    content,
+                    source=self._display_source(file_path, path),
+                    source_id=file_path.resolve().as_posix(),
+                )
                 if count:
                     report.files += 1
                     report.chunks += count

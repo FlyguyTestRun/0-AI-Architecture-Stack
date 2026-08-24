@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | AGENTS.md, six modes, five ADRs |
-| Test suite | VALIDATED | 176 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 185 tests, no network, no Docker, no model server |
 
 ---
 
@@ -110,6 +110,31 @@ Recorded rather than hidden.
 ---
 
 ## Change log
+
+### 2026-08-24, fifth pass
+
+Three findings from a second automated review, all three verified and all three
+real. Two of them are follow ups to fixes made earlier the same day, which is a
+useful reminder that a fix is not done until the property it claims is tested.
+
+- **The unique source fix was incomplete.** Deriving identity from the path
+  relative to the ingest argument fixed the case it was tested against and left
+  two others open: ingesting two sibling directories separately still collided,
+  and ingesting a parent then a child produced a stale duplicate. Identity is now
+  the resolved absolute path, separated from the human readable display name that
+  appears in citations. The two answer different questions and should not have
+  been the same value.
+- **The refusal disclosed what it was protecting.** The ingest allowlist added
+  earlier returned the requested path and every configured root in its 403 body,
+  which the API forwards to an unauthenticated caller. A refusal became a way to
+  probe the filesystem and locate the corpus. The detail now goes to the server
+  log and the caller gets a generic message that still explains how to widen the
+  boundary.
+- **The attribution rule was only half enforced.** The pre-commit hook scans
+  staged file diffs, which never contain the commit message, yet the rule names
+  commit message trailers explicitly. A `commit-msg` hook now covers that half,
+  matching by shape rather than by brand and reusing the shared dash checker
+  rather than reimplementing the match in shell.
 
 ### 2026-08-24, fourth pass
 

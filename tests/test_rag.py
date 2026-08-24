@@ -6,6 +6,7 @@ import pytest
 
 from zerostack.rag.chunking import chunk_text
 from zerostack.rag.embeddings import HashingEmbeddings
+from zerostack.rag.pipeline import RAGPipeline
 from zerostack.rag.store import MemoryVectorStore
 
 
@@ -372,3 +373,64 @@ class TestSourceUniqueness:
         rag.store.ensure_collection(rag.embeddings.dimensions)
         rag.ingest_path(nested_corpus / "hr" / "policy.md")
         assert rag.retrieve("vacation", top_k=1)[0].source == "policy.md"
+
+
+class TestSourceIdentityStability:
+    """The same file must keep one identity however the caller reached it.
+
+    Deriving identity from the path relative to the ingest argument was not
+    enough. Ingesting two sibling directories separately still collided, and
+    ingesting a parent then a child produced two ids for one file and left a
+    stale duplicate in the index.
+    """
+
+    @pytest.fixture
+    def tree(self, tmp_path):
+        for team, text in (
+            ("hr", "HR policy: staff receive twenty vacation days per year."),
+            ("legal", "Legal policy: contracts require two signatures."),
+        ):
+            (tmp_path / team).mkdir()
+            (tmp_path / team / "policy.md").write_text(text, encoding="utf-8")
+        return tmp_path
+
+    def _pipeline(self, settings, tree):
+        settings.rag.corpus_dir = tree
+        return RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+
+    def test_sibling_directories_ingested_separately_do_not_collide(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree / "hr")
+        pipeline.ingest_path(tree / "legal")
+        assert pipeline.store.count() == 2
+
+    def test_reingesting_a_subdirectory_leaves_no_stale_duplicate(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree)
+        assert pipeline.store.count() == 2
+        pipeline.ingest_path(tree / "hr")
+        assert pipeline.store.count() == 2
+
+    def test_display_source_is_stable_across_entry_points(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree / "hr")
+        via_subdir = {r.source for r in pipeline.retrieve("vacation", top_k=5)}
+
+        other = self._pipeline(settings, tree)
+        other.ingest_path(tree)
+        via_root = {r.source for r in other.retrieve("vacation", top_k=5)}
+
+        assert "hr/policy.md" in via_subdir
+        assert "hr/policy.md" in via_root
+
+    def test_chunk_identity_falls_back_to_source_when_absent(self):
+        chunks = chunk_text("some text about refunds", source="a.md")
+        assert chunks[0].chunk_id == "a.md::0"
+
+    def test_chunk_identity_uses_source_id_when_present(self):
+        chunks = chunk_text("some text about refunds", source="a.md", source_id="/abs/a.md")
+        assert chunks[0].chunk_id == "/abs/a.md::0"

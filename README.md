@@ -11,7 +11,7 @@ questions from your own documents and shows its sources.
 [![CI](https://github.com/FlyguyTestRun/0-AI-Architecture-Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/FlyguyTestRun/0-AI-Architecture-Stack/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-176%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen.svg)](tests/)
 
 [Quick start](#quick-start-60-seconds) ·
 [What it does](#what-it-actually-does) ·
@@ -387,7 +387,7 @@ the run record. That is now covered by concurrency tests.
 
 ### Testing
 
-**176 tests, no network, no containers, no model server.** That constraint is
+**185 tests, no network, no containers, no model server.** That constraint is
 deliberate: it keeps the suite fast and deterministic, and it means the offline path
 is exercised on every commit and cannot rot.
 
@@ -430,7 +430,7 @@ src/zerostack/
 apps/streamlit_app/     Layer 1 browser frontend
 docs/adr/               Architecture decision records
 modes/                  Operational mode definitions
-tests/                  176 tests, no services required
+tests/                  185 tests, no services required
 ```
 
 ---
@@ -474,7 +474,7 @@ orchestrator cannot tell them apart. See
 ```bash
 make setup     # virtualenv and install
 make check     # everything CI runs
-git config core.hooksPath .githooks   # enable the pre-commit checks
+git config core.hooksPath .githooks   # enable the pre-commit and commit-msg checks
 ```
 
 Operating rules are in [AGENTS.md](AGENTS.md) and are not optional. Two are enforced

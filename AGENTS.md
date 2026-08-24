@@ -26,7 +26,9 @@ current work queue.
   in any file, pull request body, or code comment.
 - No assistant, model, or vendor product names anywhere in committed content. Describe
   the capability, not the brand: "a code agent", not a product name.
-- The pre-commit hook blocks the common patterns. Do not work around it.
+- The `pre-commit` hook blocks these patterns in file contents and the `commit-msg`
+  hook blocks them in commit messages. Enable both with
+  `git config core.hooksPath .githooks`. Do not work around either.
 
 The rule covers both attribution and naming. Earlier revisions of this file allowed
 naming a tool as an architectural component; that exception is withdrawn. Layer 6 is
