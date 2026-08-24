@@ -8,12 +8,19 @@ network access.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 
 import pytest
 
 from zerostack.app import ZerostackApp
 from zerostack.config import Settings
 from zerostack.observability.tracing import Tracer
+
+
+def tmp_path_factory_dir() -> str:
+    """An empty directory, so no .env file on disk can reach Settings()."""
+    return tempfile.mkdtemp(prefix="zerostack-clean-")
 
 
 @pytest.fixture
@@ -100,11 +107,31 @@ class TestTracing:
 
 
 class TestConfiguration:
-    def test_defaults_load_without_any_environment(self):
+    def test_defaults_load_without_any_environment(self, monkeypatch):
+        """Defaults must hold with a genuinely clean environment.
+
+        This previously read the ambient environment and passed only because no
+        ZEROSTACK_ variable happened to be set. Running it with
+        ZEROSTACK_ORCHESTRATOR_KIND exported, as the orchestrator matrix job
+        does, failed it. A test that asserts "without any environment" has to
+        clear the environment, or it asserts nothing.
+        """
+        for name in list(os.environ):
+            if name.startswith("ZEROSTACK_"):
+                monkeypatch.delenv(name, raising=False)
+        # A .env file on the developer's machine would defeat the same intent.
+        monkeypatch.chdir(tmp_path_factory_dir())
+
         settings = Settings()
         assert settings.llm.provider == "auto"
         assert settings.rag.backend == "auto"
         assert settings.orchestrator.kind == "auto"
+        assert settings.rag.embedding_backend == "auto"
+
+    def test_environment_is_read_even_when_defaults_exist(self, monkeypatch):
+        """The inverse of the test above: an exported value must win."""
+        monkeypatch.setenv("ZEROSTACK_ORCHESTRATOR_KIND", "simple")
+        assert Settings().orchestrator.kind == "simple"
 
     def test_environment_overrides_are_read(self, monkeypatch):
         monkeypatch.setenv("ZEROSTACK_LLM_PROVIDER", "echo")

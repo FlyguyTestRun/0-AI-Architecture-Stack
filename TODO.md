@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | CLAUDE.md, six modes, five ADRs |
-| Test suite | VALIDATED | 147 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 148 tests, no network, no Docker, no model server |
 
 ---
 
@@ -143,6 +143,12 @@ than skipping:
   LangGraph parity test skips when LangGraph is absent, so it ran nowhere and the
   central claim of ADR ZS-003 went unverified in CI. The matrix job now runs the
   suite.
+
+Running the suite in the matrix job then exposed a third: a test named
+`test_defaults_load_without_any_environment` never cleared the environment, so it
+asserted nothing and passed only because no `ZEROSTACK_` variable happened to be
+set. It now clears them, and a paired test asserts an exported value still wins.
+The whole suite is verified against every environment combination CI uses.
 
 Also closed two coverage gaps: the Streamlit app is now driven by `AppTest`, and
 Chroma has its own suite. Both extras are installed in CI so neither skips. The
