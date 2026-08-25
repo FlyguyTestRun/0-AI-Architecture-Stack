@@ -434,3 +434,81 @@ class TestSourceIdentityStability:
     def test_chunk_identity_uses_source_id_when_present(self):
         chunks = chunk_text("some text about refunds", source="a.md", source_id="/abs/a.md")
         assert chunks[0].chunk_id == "/abs/a.md::0"
+
+
+class TestHybridRetrieval:
+    """Vector and keyword retrieval fail in different places, so both run."""
+
+    @pytest.fixture
+    def hybrid(self, settings):
+        settings.rag.retrieval_mode = "auto"
+        pipeline = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        pipeline.ingest_text(
+            "Support agents may issue a refund up to two hundred dollars without approval.",
+            source="support.md",
+        )
+        pipeline.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected the transaction.",
+            source="errors.md",
+        )
+        return pipeline
+
+    def test_keyword_index_is_populated_on_ingest(self, hybrid):
+        assert hybrid.keyword.size == 2
+
+    def test_an_exact_identifier_is_retrievable(self, hybrid):
+        results = hybrid.retrieve("E-4471", top_k=3)
+        assert results and results[0].source == "errors.md"
+
+    def test_a_semantic_question_still_works(self, hybrid):
+        results = hybrid.retrieve("refund without approval", top_k=3)
+        assert results and results[0].source == "support.md"
+
+    def test_the_relevance_cutoff_applies_to_fused_results(self, hybrid):
+        """Sources must reflect what grounded the answer in every mode."""
+        results = hybrid.retrieve("E-4471", top_k=4)
+        assert {result.source for result in results} == {"errors.md"}
+
+    def test_vector_only_mode_ignores_the_keyword_tier(self, hybrid):
+        hybrid.settings.retrieval_mode = "vector"
+        assert hybrid.retrieve("refund", top_k=2) is not None
+
+    def test_keyword_only_mode_returns_keyword_hits(self, hybrid):
+        hybrid.settings.retrieval_mode = "keyword"
+        results = hybrid.retrieve("E-4471", top_k=2)
+        assert results and results[0].source == "errors.md"
+
+    def test_describe_reports_the_keyword_tier(self, hybrid):
+        described = hybrid.describe()
+        assert described["keyword_index_size"] == 2
+        assert described["retrieval_mode"] == "auto"
+
+    def test_the_keyword_index_is_rebuilt_from_the_store(self, settings, tmp_path):
+        """A restart must not silently drop the keyword half of hybrid search."""
+        from zerostack.rag.store import QdrantVectorStore
+
+        settings.rag.retrieval_mode = "auto"
+        path = str(tmp_path / "q")
+
+        first = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        first.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected it.", source="errors.md"
+        )
+        assert first.keyword.size == 1
+        del first
+
+        second = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        assert second.keyword.size == 1, "keyword tier was lost across the restart"
+        assert second.retrieve("E-4471", top_k=2)[0].source == "errors.md"

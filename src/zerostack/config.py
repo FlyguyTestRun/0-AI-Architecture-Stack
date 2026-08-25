@@ -68,6 +68,15 @@ class RAGSettings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 120
     top_k: int = 4
+    # auto and hybrid both fuse keyword and vector results. Keyword catches exact
+    # terms a vector index never saw, such as part numbers, error codes and policy
+    # names; vector catches meaning. Neither alone is sufficient on real documents.
+    retrieval_mode: Literal["auto", "hybrid", "vector", "keyword"] = "auto"
+    keyword_weight: float = 1.0
+    vector_weight: float = 1.0
+    # Candidates pulled from each retriever before fusion. Wider than top_k so
+    # fusion has room to promote something the other retriever ranked highly.
+    fusion_candidates: int = 20
     score_threshold: float = 0.0
     # Drop any hit scoring below this fraction of the best hit. An absolute threshold
     # is not portable across embedding backends, a relative one is.

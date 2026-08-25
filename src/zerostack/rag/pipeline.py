@@ -10,6 +10,7 @@ from zerostack.config import RAGSettings, get_settings
 from zerostack.observability import get_tracer
 from zerostack.rag.chunking import Chunk, chunk_text
 from zerostack.rag.embeddings import EmbeddingProvider, build_embeddings
+from zerostack.rag.keyword import BM25Index, reciprocal_rank_fusion
 from zerostack.rag.store import (
     ChromaVectorStore,
     MemoryVectorStore,
@@ -101,6 +102,12 @@ class RAGPipeline:
         )
         self.store = store or build_vector_store(self.settings)
         self.store.ensure_collection(self.embeddings.dimensions)
+        self.keyword = BM25Index()
+        self._keyword_chunks: dict[str, Chunk] = {}
+        # The vector store may already hold documents from a previous process
+        # while the keyword index starts empty every time, so it is rebuilt from
+        # the store rather than left silently behind.
+        self._sync_keyword_index()
 
     def ingest_text(self, text: str, source: str, source_id: str = "", **metadata: object) -> int:
         """Chunk, embed and upsert a single document. Returns the chunk count."""
@@ -167,20 +174,113 @@ class RAGPipeline:
 
         return report
 
+    def _sync_keyword_index(self) -> None:
+        """Rebuild the keyword index from whatever the vector store holds."""
+        try:
+            chunks = list(self.store.iter_chunks())
+        except Exception as exc:
+            logger.warning("could not rebuild the keyword index: %s", exc)
+            return
+        if not chunks:
+            return
+        self.keyword.clear()
+        self._keyword_chunks.clear()
+        self._index_keywords(chunks)
+        logger.info("rag layer: keyword index rebuilt from %d chunk(s)", len(chunks))
+
+    def _index_keywords(self, chunks: list[Chunk]) -> None:
+        for chunk in chunks:
+            self.keyword.add(chunk.chunk_id, chunk.text)
+            self._keyword_chunks[chunk.chunk_id] = chunk
+
     def _upsert(self, chunks: list[Chunk]) -> int:
         if not chunks:
             return 0
         vectors = self.embeddings.embed([chunk.text for chunk in chunks])
-        return self.store.upsert(chunks, vectors)
+        written = self.store.upsert(chunks, vectors)
+        self._index_keywords(chunks)
+        return written
+
+    def _vector_search(self, query: str, limit: int) -> list[SearchResult]:
+        vector = self.embeddings.embed_one(query)
+        return self.store.search(vector, top_k=limit, score_threshold=self.settings.score_threshold)
+
+    def _keyword_search(self, query: str, limit: int) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        for hit in self.keyword.search(query, top_k=limit):
+            chunk = self._keyword_chunks.get(hit.chunk_id)
+            if chunk is None:
+                continue
+            results.append(
+                SearchResult(
+                    chunk_id=hit.chunk_id,
+                    text=chunk.text,
+                    source=chunk.source,
+                    score=hit.score,
+                    metadata=chunk.metadata,
+                )
+            )
+        return results
+
+    def _fuse(
+        self, vector_hits: list[SearchResult], keyword_hits: list[SearchResult], top_k: int
+    ) -> list[SearchResult]:
+        """Blend two ranked lists by rank position rather than raw score.
+
+        BM25 scores and cosine similarities are on different unnormalised scales,
+        so adding them would let whichever happens to be numerically larger
+        decide the order. Rank is comparable across retrievers; score is not.
+        """
+        by_id = {result.chunk_id: result for result in vector_hits}
+        by_id.update({result.chunk_id: result for result in keyword_hits})
+
+        fused = reciprocal_rank_fusion(
+            [[r.chunk_id for r in vector_hits], [r.chunk_id for r in keyword_hits]],
+            weights=[self.settings.vector_weight, self.settings.keyword_weight],
+        )
+
+        merged: list[SearchResult] = []
+        for chunk_id, score in fused[:top_k]:
+            result = by_id.get(chunk_id)
+            if result is None:
+                continue
+            merged.append(
+                SearchResult(
+                    chunk_id=result.chunk_id,
+                    text=result.text,
+                    source=result.source,
+                    score=score,
+                    metadata=result.metadata,
+                )
+            )
+        return merged
 
     def retrieve(self, query: str, top_k: int | None = None) -> list[SearchResult]:
         """Return the chunks most relevant to ``query``."""
         top_k = top_k or self.settings.top_k
-        with get_tracer().span("rag.retrieve", query=query, top_k=top_k) as span:
-            vector = self.embeddings.embed_one(query)
-            results = self.store.search(
-                vector, top_k=top_k, score_threshold=self.settings.score_threshold
-            )
+        mode = self.settings.retrieval_mode
+        with get_tracer().span("rag.retrieve", query=query, top_k=top_k, mode=mode) as span:
+            candidates = max(top_k, self.settings.fusion_candidates)
+            use_keyword = mode in ("auto", "hybrid", "keyword") and self.keyword.size > 0
+            use_vector = mode in ("auto", "hybrid", "vector")
+
+            vector_hits = self._vector_search(query, candidates) if use_vector else []
+            keyword_hits = self._keyword_search(query, candidates) if use_keyword else []
+
+            if use_vector and use_keyword:
+                results = self._fuse(vector_hits, keyword_hits, top_k)
+                span.set(fused=True, vector_hits=len(vector_hits), keyword_hits=len(keyword_hits))
+            elif use_keyword:
+                results = keyword_hits[:top_k]
+            else:
+                results = vector_hits[:top_k]
+
+            # The cutoff applies to every mode. It exists so the reported sources
+            # reflect what actually grounded the answer rather than whatever
+            # filled out top k, and skipping it on the fused path quietly broke
+            # that promise. On fused scores the ratio also does useful work: a
+            # chunk both retrievers returned scores about twice one that only
+            # appeared in a single list, so the default cleanly prefers agreement.
             results = self._apply_relevance_cutoff(results)
             span.set(
                 hits=len(results),
@@ -223,4 +323,6 @@ class RAGPipeline:
             "embeddings": self.embeddings.name,
             "dimensions": self.embeddings.dimensions,
             "indexed_chunks": self.store.count(),
+            "retrieval_mode": self.settings.retrieval_mode,
+            "keyword_index_size": self.keyword.size,
         }

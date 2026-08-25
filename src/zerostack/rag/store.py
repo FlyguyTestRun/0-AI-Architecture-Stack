@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -50,6 +51,17 @@ class VectorStore(Protocol):
     def count(self) -> int: ...
 
     def reset(self) -> None: ...
+
+    def iter_chunks(self) -> Iterator[Chunk]:
+        """Yield every stored chunk.
+
+        The keyword index lives in memory while the vector store persists, so
+        after a restart the two would disagree unless the keyword side can be
+        rebuilt from what the vector store already holds. Without this, hybrid
+        retrieval would silently degrade to vector only on every run after the
+        first, which is the kind of quiet regression nobody notices.
+        """
+        ...
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -111,6 +123,9 @@ class MemoryVectorStore:
     def reset(self) -> None:
         self._vectors.clear()
         self._chunks.clear()
+
+    def iter_chunks(self) -> Iterator[Chunk]:
+        yield from list(self._chunks)
 
 
 class QdrantVectorStore:
@@ -214,6 +229,32 @@ class QdrantVectorStore:
             return 0
         return int(self._client.count(self.collection, exact=True).count)
 
+    def iter_chunks(self) -> Iterator[Chunk]:
+        if not self._client.collection_exists(self.collection):
+            return
+        offset = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=self.collection,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                chunk_id = payload.get("chunk_id", str(point.id))
+                source_id, _, index = chunk_id.rpartition("::")
+                yield Chunk(
+                    text=payload.get("text", ""),
+                    source=payload.get("source", "unknown"),
+                    index=int(index) if index.isdigit() else 0,
+                    metadata=payload.get("metadata", {}) or {},
+                    source_id=source_id,
+                )
+            if offset is None:
+                break
+
     def reset(self) -> None:
         """Empty the collection and leave the store ready for use."""
         if self._client.collection_exists(self.collection):
@@ -282,6 +323,22 @@ class ChromaVectorStore:
 
     def count(self) -> int:
         return int(self._collection.count())
+
+    def iter_chunks(self) -> Iterator[Chunk]:
+        response = self._collection.get(include=["documents", "metadatas"])
+        ids = response.get("ids", []) or []
+        documents = response.get("documents", []) or []
+        metadatas = response.get("metadatas", []) or []
+        for chunk_id, document, metadata in zip(ids, documents, metadatas, strict=False):
+            metadata = dict(metadata or {})
+            source_id, _, index = str(chunk_id).rpartition("::")
+            yield Chunk(
+                text=document or "",
+                source=metadata.pop("source", "unknown"),
+                index=int(index) if index.isdigit() else 0,
+                metadata=metadata,
+                source_id=source_id,
+            )
 
     def reset(self) -> None:
         self._client.delete_collection(self.collection_name)
