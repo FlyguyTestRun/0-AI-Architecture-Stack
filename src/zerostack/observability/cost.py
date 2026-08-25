@@ -13,7 +13,10 @@ a starting point that a deployment is expected to set for its own contract.
 from __future__ import annotations
 
 import re
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 # Per million tokens, as (prompt, completion). A locally hosted model has no per
 # token price, so it is zero and the accounting still records the volume.
@@ -68,12 +71,22 @@ class BudgetExceeded(RuntimeError):
     """Raised when a call would take a window past its configured ceiling."""
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class CostTracker:
-    """Accumulates usage and refuses calls past a ceiling.
+    """Accumulates usage and refuses calls past a daily ceiling.
 
     The ceiling is checked before a call rather than after, because a limit that
     only reports the overspend afterwards is a report, not a limit.
+
+    The budget is daily in fact and not only in name: the counters roll over at
+    the UTC day boundary. Without that a deployment that sets a budget spends it
+    once and then refuses every request forever, because nothing would ever
+    lower the running total again. A ceiling that never reopens is an outage
+    with a schedule, which is worse than having no ceiling at all.
     """
 
     prices: dict[str, tuple[float, float]] = field(default_factory=lambda: dict(DEFAULT_PRICES))
@@ -83,6 +96,29 @@ class CostTracker:
     tokens_used: int = 0
     cost_used_usd: float = 0.0
     calls: int = 0
+
+    # Injectable so a test can cross a day boundary without waiting for one.
+    clock: Callable[[], datetime] = _utc_now
+    window_day: str = ""
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.window_day:
+            self.window_day = self.clock().date().isoformat()
+
+    def _roll_if_new_day(self) -> None:
+        """Start a fresh window when the calendar day has turned.
+
+        The caller must hold the lock: this is a check followed by a write, and
+        two request threads arriving at midnight would otherwise both observe
+        the old day and one would reset the other's freshly recorded usage.
+        """
+        today = self.clock().date().isoformat()
+        if today != self.window_day:
+            self.window_day = today
+            self.tokens_used = 0
+            self.cost_used_usd = 0.0
+            self.calls = 0
 
     def price_for(self, model: str) -> tuple[float, float]:
         """Look up a price, falling back to the longest matching prefix.
@@ -116,12 +152,16 @@ class CostTracker:
         )
 
     def record(self, usage: Usage) -> None:
-        self.tokens_used += usage.total_tokens
-        self.cost_used_usd += usage.cost_usd
-        self.calls += 1
+        with self._lock:
+            self._roll_if_new_day()
+            self.tokens_used += usage.total_tokens
+            self.cost_used_usd += usage.cost_usd
+            self.calls += 1
 
     def check(self, projected_tokens: int = 0, projected_cost_usd: float = 0.0) -> None:
         """Raise if this call would breach a configured ceiling."""
+        with self._lock:
+            self._roll_if_new_day()
         if self.daily_token_budget and (
             self.tokens_used + projected_tokens > self.daily_token_budget
         ):
@@ -137,11 +177,15 @@ class CostTracker:
             )
 
     def reset(self) -> None:
-        self.tokens_used = 0
-        self.cost_used_usd = 0.0
-        self.calls = 0
+        with self._lock:
+            self.tokens_used = 0
+            self.cost_used_usd = 0.0
+            self.calls = 0
+            self.window_day = self.clock().date().isoformat()
 
     def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            self._roll_if_new_day()
         remaining_tokens = (
             max(0, self.daily_token_budget - self.tokens_used) if self.daily_token_budget else None
         )
@@ -158,4 +202,5 @@ class CostTracker:
             "daily_cost_budget_usd": self.daily_cost_budget_usd or None,
             "tokens_remaining": remaining_tokens,
             "cost_remaining_usd": remaining_cost,
+            "window_day": self.window_day,
         }

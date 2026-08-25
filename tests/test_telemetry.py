@@ -9,6 +9,7 @@ number that was already being tracked rather than a surprise.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,6 +17,7 @@ from zerostack.observability.cache import SemanticCache
 from zerostack.observability.cost import (
     BudgetExceeded,
     CostTracker,
+    Usage,
     estimate_tokens,
 )
 from zerostack.observability.metrics import MetricsRegistry
@@ -243,3 +245,78 @@ class TestSemanticCache:
         question = "How much can a support agent refund without approval?"
         cache.lookup(embeddings.embed_one(question))
         assert cache.snapshot()["served_from_cache"] == 1
+
+
+class TestDailyBudgetWindow:
+    """A budget named daily must actually roll over.
+
+    Without a window the running total only ever rises, so the first day that
+    spends the allowance refuses every request from then on. That is not a
+    ceiling, it is a permanent outage that arrives on a schedule.
+    """
+
+    @staticmethod
+    def _tracker(moment: datetime, **kwargs) -> CostTracker:
+        holder = {"now": moment}
+        tracker = CostTracker(clock=lambda: holder["now"], **kwargs)
+        tracker._holder = holder  # type: ignore[attr-defined]
+        return tracker
+
+    def test_the_ceiling_holds_within_a_day(self):
+        tracker = self._tracker(datetime(2026, 8, 25, 9, 0, tzinfo=UTC), daily_token_budget=100)
+        tracker.record(Usage(prompt_tokens=100))
+        with pytest.raises(BudgetExceeded):
+            tracker.check(projected_tokens=1)
+
+    def test_the_window_reopens_on_the_next_day(self):
+        tracker = self._tracker(datetime(2026, 8, 25, 23, 59, tzinfo=UTC), daily_token_budget=100)
+        tracker.record(Usage(prompt_tokens=100))
+        with pytest.raises(BudgetExceeded):
+            tracker.check(projected_tokens=1)
+        tracker._holder["now"] = datetime(2026, 8, 26, 0, 1, tzinfo=UTC)
+        tracker.check(projected_tokens=1)
+
+    def test_rolling_over_clears_the_counters(self):
+        tracker = self._tracker(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), daily_token_budget=100)
+        tracker.record(Usage(prompt_tokens=80))
+        tracker._holder["now"] = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        snapshot = tracker.snapshot()
+        assert snapshot["tokens_used"] == 0
+        assert snapshot["calls"] == 0
+        assert snapshot["window_day"] == "2026-08-26"
+
+    def test_a_new_day_does_not_lift_the_ceiling_twice(self):
+        """Spending the fresh allowance must exhaust it again."""
+        tracker = self._tracker(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), daily_token_budget=100)
+        tracker.record(Usage(prompt_tokens=100))
+        tracker._holder["now"] = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        tracker.record(Usage(prompt_tokens=100))
+        with pytest.raises(BudgetExceeded):
+            tracker.check(projected_tokens=1)
+
+    def test_the_cost_ceiling_rolls_over_too(self):
+        tracker = self._tracker(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), daily_cost_budget_usd=1.0)
+        tracker.record(Usage(prompt_tokens=1, cost_usd=1.0))
+        with pytest.raises(BudgetExceeded):
+            tracker.check(projected_cost_usd=0.01)
+        tracker._holder["now"] = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        tracker.check(projected_cost_usd=0.01)
+
+    def test_concurrent_records_across_a_boundary_do_not_lose_the_reset(self):
+        """The rollover is a check followed by a write, so it needs the lock."""
+        tracker = self._tracker(datetime(2026, 8, 25, 12, 0, tzinfo=UTC))
+        tracker.record(Usage(prompt_tokens=50))
+        tracker._holder["now"] = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+
+        def worker() -> None:
+            for _ in range(500):
+                tracker.record(Usage(prompt_tokens=1))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # The 50 from the previous day must not survive the boundary.
+        assert tracker.tokens_used == 2000
+        assert tracker.window_day == "2026-08-26"
