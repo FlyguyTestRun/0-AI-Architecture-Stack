@@ -1,7 +1,7 @@
 # Task queue
 
-**Last updated:** 2026-08-24
-**Current phase:** Foundation complete, hardening next
+**Last updated:** 2026-08-25
+**Current phase:** Platform expansion shipped, hardening the metered surfaces
 **Active mode:** BUILD
 
 ---
@@ -74,17 +74,19 @@ tokens as they arrive.
 
 Acceptance: the Streamlit app renders tokens incrementally against Ollama.
 
-### 4. Authentication, BLOCKED
+### 4. Authentication, SHIPPED
 
-Blocked on a decision: is the first deployment single tenant or multi tenant? The
-answer changes the data model, not just the middleware.
+Resolved multi tenant. The namespace is the tenancy primitive: every chunk carries
+one, retrieval filters on it, the cache partitions by it, and a principal is granted
+a set of them. See ZS-007.
 
-- Single tenant: an API key check on the FastAPI boundary is enough.
-- Multi tenant: every table needs a tenant column, every query needs a tenant filter,
-  and the vector collection needs per tenant partitioning.
+The namespace grammar is now enforced at both boundaries, so a namespace is an
+identifier rather than free text. See ZS-009 for why that mattered.
 
-Do not start until that is settled. Retrofitting tenancy is far more expensive than
-building it in.
+Still open, and deliberately not started:
+
+- Per tenant encryption at rest. Needs a key management decision first.
+- An operator facing key rotation flow. The store hashes keys; nothing rotates them.
 
 ### 5. Next.js frontend, PLANNED
 
@@ -110,6 +112,24 @@ Recorded rather than hidden.
 ---
 
 ## Change log
+
+### 2026-08-25, hardening the metered surfaces
+
+Probed the four pieces of state the expansion added that grow with traffic. Each
+was correct on the path it was written for and wrong over months of running.
+Three of the four looked right on the page and were found by measurement.
+
+| Defect | Evidence | Fix |
+|--------|----------|-----|
+| Namespace was never validated, and it reaches a metric label | 5000 namespaces produced 5000 series and 263KB of exposition output, never evicted; a wildcard principal is the default on the offline path | An identifier grammar enforced at the API and again in `ZerostackApp` |
+| Rate limit buckets keyed on the principal name | Two credentials both named `app`, configured 4/min each, received 4 requests between them instead of 8 | Buckets key on `Principal.caller_id()`, derived from the credential |
+| Idle bucket eviction ran on every request | 200 checks against 20k tracked callers took 115ms, growing linearly | Swept on an interval; the same 200 checks now take 0.2ms |
+| The daily budget had no daily window | A tracker that spent its allowance refused every request from then until process restart | Counters roll at the UTC day boundary, under the lock |
+| Ingestion invalidated the cache with every source in the store | Any ingestion dropped every cached answer, so caching was worthless on a schedule | `IngestReport` carries what the run wrote; invalidation uses that |
+
+Tests 359 to 401. Every fix was demonstrated failing before it was written, and
+each regression test was confirmed to fail against the old behaviour rather than
+being assumed to. Recorded as ZS-009.
 
 ### 2026-08-25, expansion
 

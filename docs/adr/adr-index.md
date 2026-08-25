@@ -21,3 +21,4 @@ Prefixes:
 | ZS-006 | A graph tier for questions spread across documents | Accepted |
 | ZS-007 | Enterprise controls are opt in, not a separate edition | Accepted |
 | ZS-008 | Retrieval quality is measured, not assumed | Accepted |
+| ZS-009 | Metered state is bounded and windowed | Accepted |
