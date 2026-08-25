@@ -434,3 +434,121 @@ class TestSourceIdentityStability:
     def test_chunk_identity_uses_source_id_when_present(self):
         chunks = chunk_text("some text about refunds", source="a.md", source_id="/abs/a.md")
         assert chunks[0].chunk_id == "/abs/a.md::0"
+
+
+class TestHybridRetrieval:
+    """Vector and keyword retrieval fail in different places, so both run."""
+
+    @pytest.fixture
+    def hybrid(self, settings):
+        settings.rag.retrieval_mode = "auto"
+        pipeline = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        pipeline.ingest_text(
+            "Support agents may issue a refund up to two hundred dollars without approval.",
+            source="support.md",
+        )
+        pipeline.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected the transaction.",
+            source="errors.md",
+        )
+        return pipeline
+
+    def test_keyword_index_is_populated_on_ingest(self, hybrid):
+        assert hybrid.keyword.size == 2
+
+    def test_an_exact_identifier_is_retrievable(self, hybrid):
+        results = hybrid.retrieve("E-4471", top_k=3)
+        assert results and results[0].source == "errors.md"
+
+    def test_a_semantic_question_still_works(self, hybrid):
+        results = hybrid.retrieve("refund without approval", top_k=3)
+        assert results and results[0].source == "support.md"
+
+    def test_the_relevance_cutoff_applies_to_fused_results(self, hybrid):
+        """Sources must reflect what grounded the answer in every mode."""
+        results = hybrid.retrieve("E-4471", top_k=4)
+        assert {result.source for result in results} == {"errors.md"}
+
+    def test_vector_only_mode_ignores_the_keyword_tier(self, hybrid):
+        hybrid.settings.retrieval_mode = "vector"
+        assert hybrid.retrieve("refund", top_k=2) is not None
+
+    def test_keyword_only_mode_returns_keyword_hits(self, hybrid):
+        hybrid.settings.retrieval_mode = "keyword"
+        results = hybrid.retrieve("E-4471", top_k=2)
+        assert results and results[0].source == "errors.md"
+
+    def test_describe_reports_the_keyword_tier(self, hybrid):
+        described = hybrid.describe()
+        assert described["keyword_index_size"] == 2
+        assert described["retrieval_mode"] == "auto"
+
+    def test_the_keyword_index_is_rebuilt_from_the_store(self, settings, tmp_path):
+        """A restart must not silently drop the keyword half of hybrid search."""
+        from zerostack.rag.store import QdrantVectorStore
+
+        settings.rag.retrieval_mode = "auto"
+        path = str(tmp_path / "q")
+
+        first = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        first.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected it.", source="errors.md"
+        )
+        assert first.keyword.size == 1
+        del first
+
+        second = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        assert second.keyword.size == 1, "keyword tier was lost across the restart"
+        assert second.retrieve("E-4471", top_k=2)[0].source == "errors.md"
+
+
+class TestGraphTier:
+    @pytest.fixture
+    def pipeline(self, settings):
+        settings.rag.graph_enabled = True
+        built = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        built.ingest_text("The Refund Policy is owned by the Support Lead.", source="refunds.md")
+        built.ingest_text(
+            "The Escalation Policy is owned by the Engineering Director. "
+            "The Escalation Policy governs Severity 1 handling.",
+            source="escalation.md",
+        )
+        built.ingest_text("The Support Lead may raise a ticket to Severity 1.", source="oncall.md")
+        return built
+
+    def test_the_graph_is_built_during_ingestion(self, pipeline):
+        assert pipeline.graph.relation_count > 0
+
+    def test_graph_context_connects_across_documents(self, pipeline):
+        rendered = pipeline.graph_context(
+            "What links the Support Lead to the Engineering Director?"
+        )
+        assert "escalation.md" in rendered or "oncall.md" in rendered
+
+    def test_an_unknown_entity_costs_nothing(self, pipeline):
+        assert pipeline.graph_context("quantum chromodynamics") == ""
+
+    def test_the_tier_can_be_disabled(self, pipeline):
+        pipeline.settings.graph_enabled = False
+        assert pipeline.graph_context("Support Lead") == ""
+
+    def test_describe_reports_the_graph(self, pipeline):
+        described = pipeline.describe()["graph"]
+        assert described["entities"] > 0
+        assert described["extractor"] == "pattern"

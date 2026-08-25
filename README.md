@@ -11,7 +11,7 @@ questions from your own documents and shows its sources.
 [![CI](https://github.com/FlyguyTestRun/0-AI-Architecture-Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/FlyguyTestRun/0-AI-Architecture-Stack/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-359%20passing-brightgreen.svg)](tests/)
 
 [Quick start](#quick-start-60-seconds) ·
 [What it does](#what-it-actually-does) ·
@@ -163,15 +163,47 @@ question, the documents, or the system.
 |---|-------|---------------------------|------------|
 | 1 | **Frontend** | How people talk to it | Browser app, REST API, command line |
 | 2 | **Orchestrator** | The decision maker that runs the steps above | Three interchangeable engines |
-| 3 | **Retrieval** | The searchable library of your documents | Chunking, embeddings, four store options |
+| 3 | **Retrieval** | The searchable library of your documents | Keyword, vector and graph tiers, four store options |
 | 4 | **Language model** | The part that writes the answer | Local model server, plus an offline fallback |
 | 5 | **Tools** | How it reaches other systems | Open protocol adapter and a tool registry |
 | 6 | **Code agent** | Conventions that let a coding assistant work here safely | Operating rules, six work modes, decision records |
 | 7 | **Data** | What it remembers | Every question, answer, source and timing |
 | 8 | **Deployment** | How it gets to a server | Containers, continuous integration |
-|   | **Observability** | The flight recorder across all layers | A traced record of every step |
+|   | **Observability** | The flight recorder across all layers | Traces, metrics, cost accounting, caching |
+|   | **Security** | Who may ask what, about which documents | API keys, roles, namespaces, rate limits |
+|   | **Evaluation** | Proof that a change helped rather than hurt | Golden dataset and a merge gate |
 
 Full detail in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+### Three ways to find an answer
+
+Most systems offer one. Each fails somewhere the others do not, so this runs all
+three and combines them.
+
+| Tier | Finds | Fails at |
+|------|-------|----------|
+| **Keyword** | Exact terms: part numbers, error codes, policy names | Questions phrased in synonyms |
+| **Vector** | Meaning, regardless of wording | Terms the model never saw, like `E-4471` |
+| **Graph** | Facts spread across documents that never mention each other | Anything with no named entity |
+
+The first two are fused by rank position. The third contributes only when it
+recognises something in your question, so it costs nothing otherwise.
+
+> **Why this matters in practice.** Ask an assistant about error code `E-4471`
+> and a purely semantic system will confidently return something about payments
+> in general. Ask "what connects our support lead to our engineering director"
+> and no single passage anywhere contains the answer. Both are ordinary questions
+> and both need a tier most systems do not have.
+
+### What it records about itself
+
+| Signal | Answers | Where |
+|--------|---------|-------|
+| Traces | What happened inside one request | `data/traces.jsonl` |
+| Metrics | What is happening across all requests | `/metrics`, `/metrics.json` |
+| Cost | Tokens and estimated spend, against a ceiling | `/costs` |
+| Runs | Every question asked and what grounded the answer | `/runs` |
+| Quality | Whether a change improved or broke answers | `zerostack evaluate` |
 
 ---
 
@@ -232,9 +264,12 @@ does not have. The ingest endpoint is restricted to a configured set of director
 so it cannot be pointed at arbitrary files, but that is a boundary rather than a
 substitute for authentication.
 
-**Multi customer SaaS.** One deployment serves one organization. Adding tenancy is
-a data model change, not a middleware change, which is why it is called out as a
-blocking decision in [TODO.md](TODO.md) rather than treated as a later feature.
+**Multi customer SaaS at scale.** Namespaces isolate tenants across every
+retrieval tier, and the boundary is covered by tests. But the namespace filter is
+applied after the search rather than pushed into the vector backend, so a scoped
+query over fetches, and rate limiting is per process, so several replicas each
+permit the configured rate. Both are fine for tens of tenants on one deployment
+and want real work before hundreds across many.
 
 **Very large document collections.** The defaults are tuned for thousands of
 documents, not millions. Past roughly a hundred thousand chunks you want a managed
@@ -262,10 +297,84 @@ search box is cheaper, faster, and more predictable.
   extra install.
 - The multi agent engine is structurally complete but **unverified end to end**,
   because it needs a live model server. Treat it as unproven until exercised.
+- Graph extraction is **deterministic, not model driven**. It finds that two
+  things are related, not how they are related. That is the price of a tier that
+  costs nothing and runs offline.
 - Tool selection is **rule based**, which is deterministic and testable but does not
   generalize to open ended tool use.
 
 Every one of these is tracked in [TODO.md](TODO.md) with the work needed to close it.
+
+---
+
+## For larger and regulated deployments
+
+Every control below is **off by default**. A small team never configures them. An
+organisation that needs them turns them on with configuration rather than a
+migration, which is why there is one codebase rather than two editions
+([ADR ZS-007](docs/adr/ZS-007-enterprise-controls-are-opt-in.md)).
+
+**Authentication and roles.** API keys map to a principal with one of four
+ordered roles. Keys are stored hashed, so a leaked configuration file does not
+hand over working credentials, and compared in constant time.
+
+| Role | May |
+|------|-----|
+| `reader` | Ask questions, list tools |
+| `writer` | Everything above, plus ingest documents |
+| `operator` | Everything above, plus metrics, costs and the run log |
+| `admin` | Everything |
+
+**Tenancy through namespaces.** Documents are ingested into a namespace and
+queries are scoped to one. A principal is confined to the namespaces it is
+granted. The boundary holds across all three retrieval tiers, including a
+separate graph per namespace, so a traversal cannot walk from one tenant's
+entity into another tenant's document.
+
+**Rate limiting.** A token bucket per caller, enforced on every authenticated
+endpoint rather than only the expensive ones.
+
+**Spend ceilings.** Token and cost budgets checked before a call rather than
+after, so the limit is a limit rather than a report of the overspend.
+
+**Audit trail.** Every question is recorded with its answer, sources, timing and
+trace id, including questions served from cache.
+
+```bash
+# One principal turns every control on at once.
+ZEROSTACK_SECURITY_PRINCIPALS='{"zs_...":{"name":"hr-app","role":"writer","namespaces":["hr"],"requests_per_minute":60}}'
+ZEROSTACK_SECURITY_REQUESTS_PER_MINUTE=120
+ZEROSTACK_COST_DAILY_TOKEN_BUDGET=2000000
+```
+
+```bash
+curl -X POST localhost:8000/ask \
+  -H 'X-API-Key: zs_...' \
+  -H 'content-type: application/json' \
+  -d '{"question": "What is our refund policy?", "namespace": "hr"}'
+```
+
+---
+
+## Knowing whether it actually works
+
+Retrieval quality has no exception to catch when it breaks. It returns a
+different passage, the answer gets worse, and every test still passes. So it is
+measured rather than assumed.
+
+```bash
+zerostack evaluate                    # score against the golden dataset
+make evals                            # the same, as a threshold gate
+```
+
+The harness scores retrieval and answer quality **separately**, because a system
+can retrieve perfectly and still answer badly, and knowing which half broke is
+the point. It runs in CI and fails the build on a regression
+([ADR ZS-008](docs/adr/ZS-008-quality-is-measured.md)).
+
+This is not decoration. On its first run it found two questions where retrieval
+was perfect and the answer omitted the fact, which is how the extractive window
+came to be six sentences rather than four: measured, not guessed.
 
 ---
 
@@ -279,7 +388,7 @@ change rather than a rewrite.
 | **Evaluate** | Does this help at all? | Nothing. Clone and run | $0 |
 | **Pilot** | One team, real documents | Start the local model server for fluent answers | $0, one machine |
 | **Deploy** | The company depends on it | Move the vector store to a server, add authentication | Hosting only |
-| **Scale** | Multiple teams, large corpus | Managed vector database, reranking, tenancy | Usage based |
+| **Scale** | Multiple teams, large corpus | Namespaces per team, managed vector database, reranking | Usage based |
 | **Govern** | Regulated data, audit requirements, role based access | Move to a governed enterprise platform | Enterprise |
 
 The last row is where a purpose built platform earns its price. Compliance
@@ -387,7 +496,7 @@ the run record. That is now covered by concurrency tests.
 
 ### Testing
 
-**185 tests, no network, no containers, no model server.** That constraint is
+**359 tests, no network, no containers, no model server.** That constraint is
 deliberate: it keeps the suite fast and deterministic, and it means the offline path
 is exercised on every commit and cannot rot.
 
@@ -425,12 +534,15 @@ src/zerostack/
 ├── orchestrator/       Layer 2: shared nodes, three engines, factory
 ├── tools/              Layer 5: registry, built in tools, protocol adapter
 ├── data/               Layer 7: state and analytics
-└── observability/      Span tracing
+├── observability/      Tracing, metrics, cost accounting, caching
+├── security/           Identity, roles, namespaces, rate limiting
+└── evals/              Quality measurement and the merge gate
 
 apps/streamlit_app/     Layer 1 browser frontend
+evals/                  Golden datasets
 docs/adr/               Architecture decision records
 modes/                  Operational mode definitions
-tests/                  185 tests, no services required
+tests/                  359 tests, no services required
 ```
 
 ---
@@ -444,6 +556,9 @@ at all the stack runs offline.
 ZEROSTACK_LLM_PROVIDER=auto             # auto | local server | offline
 ZEROSTACK_RAG_BACKEND=auto              # auto | server | embedded | memory
 ZEROSTACK_ORCHESTRATOR_KIND=auto        # auto | graph | crew | simple
+ZEROSTACK_RAG_RETRIEVAL_MODE=auto       # auto | hybrid | vector | keyword
+ZEROSTACK_RAG_GRAPH_ENABLED=true        # the cross document tier
+ZEROSTACK_CACHE_ENABLED=true            # semantic answer cache
 ```
 
 ### Optional capabilities

@@ -26,9 +26,14 @@ current work queue.
   in any file, pull request body, or code comment.
 - No assistant, model, or vendor product names anywhere in committed content. Describe
   the capability, not the brand: "a code agent", not a product name.
-- The `pre-commit` hook blocks these patterns in file contents and the `commit-msg`
-  hook blocks them in commit messages. Enable both with
-  `git config core.hooksPath .githooks`. Do not work around either.
+- No assistant account in the commit author field. This is the most visible place the
+  rule can be broken: the author name sits beside every commit in the history and on
+  every pull request, and a clean commit message does not help if the byline credits
+  an assistant. Set `git config user.name` and `user.email` to a person before the
+  first commit of a session.
+- The `pre-commit` hook blocks these patterns in file contents and in the commit
+  author field, and the `commit-msg` hook blocks them in commit messages. Enable both
+  with `git config core.hooksPath .githooks`. Do not work around either.
 
 The rule covers both attribution and naming. Earlier revisions of this file allowed
 naming a tool as an architectural component; that exception is withdrawn. Layer 6 is

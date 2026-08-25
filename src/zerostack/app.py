@@ -11,14 +11,27 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from zerostack.config import Settings, get_settings
+from zerostack.config import SecuritySettings, Settings, get_settings
 from zerostack.data import RunRecord, StateStore, analytics_summary
 from zerostack.llm import build_llm
 from zerostack.llm.ollama import OllamaLLM
-from zerostack.observability import configure_logging, get_tracer
-from zerostack.orchestrator import AgentContext, AgentResult, build_orchestrator
+from zerostack.observability import (
+    CostTracker,
+    SemanticCache,
+    configure_logging,
+    get_metrics,
+    get_tracer,
+)
+from zerostack.observability.cost import DEFAULT_PRICES, estimate_tokens
+from zerostack.orchestrator import (
+    AgentContext,
+    AgentResult,
+    AgentStep,
+    build_orchestrator,
+)
 from zerostack.orchestrator.factory import available_engines
 from zerostack.rag import RAGPipeline
+from zerostack.security import PrincipalStore, RateLimiter, normalise_namespace
 from zerostack.tools import build_registry
 
 logger = logging.getLogger(__name__)
@@ -35,6 +48,22 @@ class ZerostackApp:
         self.rag = RAGPipeline(settings=self.settings.rag)
         self.tools = build_registry(include_mcp=include_mcp)
         self.store = StateStore(self.settings.data.sqlite_path)
+        self.metrics = get_metrics()
+        self.costs = CostTracker(
+            prices=_parse_prices(self.settings.cost.price_table),
+            daily_token_budget=self.settings.cost.daily_token_budget,
+            daily_cost_budget_usd=self.settings.cost.daily_cost_budget_usd,
+        )
+        self.principals = _build_principals(self.settings.security)
+        self.rate_limiter = RateLimiter(
+            requests_per_minute=self.settings.security.requests_per_minute,
+            burst=self.settings.security.rate_limit_burst,
+        )
+        self.cache = SemanticCache(
+            threshold=self.settings.cache.threshold,
+            max_entries=self.settings.cache.max_entries,
+            ttl_seconds=self.settings.cache.ttl_seconds,
+        )
 
         self.context = AgentContext(
             llm=self.llm,
@@ -44,33 +73,76 @@ class ZerostackApp:
         )
         self.orchestrator = build_orchestrator(self.context, self.settings.orchestrator)
 
-    def ask(self, question: str, persist: bool = True) -> AgentResult:
+    def ask(
+        self,
+        question: str,
+        persist: bool = True,
+        use_cache: bool = True,
+        namespace: str | None = None,
+    ) -> AgentResult:
         """Run one question through the agent and record the result."""
         if not question or not question.strip():
             raise ValueError("question must not be empty")
+        question = question.strip()
 
-        result = self.orchestrator.run(question.strip())
+        # Normalised before it reaches a metric label, a cache partition or a
+        # retrieval filter. The API validates too, but the CLI and the frontend
+        # call straight into here, so the guarantee has to live at this level.
+        namespace = normalise_namespace(namespace or self.settings.security.default_namespace)
+        self.metrics.increment("zerostack_requests_total", labels={"namespace": namespace})
+
+        cached = self._cache_lookup(question, namespace) if use_cache else None
+        if cached is not None:
+            # A cache hit is still a question somebody asked. Returning early
+            # without recording it would leave the run log, and therefore the
+            # audit trail, silently incomplete the moment caching is enabled.
+            if persist:
+                self._persist(cached, namespace)
+            return cached
+
+        if self.settings.cost.enabled:
+            # Checked before the call so the ceiling is a limit rather than a
+            # report of the overspend after the fact. The projection has to
+            # include the completion the call is about to produce: checking the
+            # question alone, and a projected cost of zero, would let a short
+            # question through on a nearly spent budget and then overshoot it by
+            # a full response before anything was recorded.
+            self.costs.check(**self._projected_spend(question))
+
+        try:
+            with self.metrics.timer("zerostack_request_seconds"):
+                result = self.orchestrator.run(question, namespace=namespace)
+        except Exception:
+            self.metrics.increment("zerostack_request_errors_total")
+            raise
+
+        self._account(question, result)
+        self._cache_store(question, result, namespace)
 
         if persist:
-            try:
-                self.store.save_run(
-                    RunRecord(
-                        question=result.question,
-                        answer=result.answer,
-                        orchestrator=result.orchestrator,
-                        llm_provider=result.llm_provider,
-                        llm_model=result.llm_model,
-                        latency_ms=result.latency_ms,
-                        trace_id=result.trace_id,
-                        sources=result.sources,
-                        steps=[step.to_dict() for step in result.steps],
-                    )
-                )
-            except Exception as exc:
-                # Persistence must never fail a user facing answer.
-                logger.warning("could not persist run: %s", exc)
+            self._persist(result, namespace)
 
         return result
+
+    def _persist(self, result: AgentResult, namespace: str = "default") -> None:
+        """Record a run. Never allowed to fail the answer it is recording."""
+        try:
+            self.store.save_run(
+                RunRecord(
+                    namespace=namespace,
+                    question=result.question,
+                    answer=result.answer,
+                    orchestrator=result.orchestrator,
+                    llm_provider=result.llm_provider,
+                    llm_model=result.llm_model,
+                    latency_ms=result.latency_ms,
+                    trace_id=result.trace_id,
+                    sources=result.sources,
+                    steps=[step.to_dict() for step in result.steps],
+                )
+            )
+        except Exception as exc:
+            logger.warning("could not persist run: %s", exc)
 
     def allowed_ingest_roots(self) -> list[Path]:
         """Directories an untrusted caller may ingest from."""
@@ -106,7 +178,106 @@ class ZerostackApp:
                 "to widen them."
             )
 
-    def ingest(self, path: Path | str | None = None, enforce_roots: bool = True) -> dict[str, Any]:
+    def _cache_lookup(self, question: str, namespace: str = "default") -> AgentResult | None:
+        """Serve a close enough previous answer, if one exists."""
+        if not self.settings.cache.enabled:
+            return None
+        try:
+            embedding = self.rag.embeddings.embed_one(question)
+        except Exception as exc:
+            logger.debug("cache lookup skipped: %s", exc)
+            return None
+
+        # A fresh trace id per request, so two callers served the same cached
+        # answer are still distinguishable in the trace and the run log.
+        trace_id = get_tracer().new_trace()
+        lookup = self.cache.lookup(embedding, namespace=namespace)
+        self.metrics.increment(
+            "zerostack_cache_events_total",
+            labels={"outcome": "hit" if lookup.hit else "miss"},
+        )
+        if not lookup.hit or lookup.entry is None:
+            return None
+
+        entry = lookup.entry
+        return AgentResult(
+            answer=entry.answer,
+            question=question,
+            orchestrator=f"{self.orchestrator.name}+cache",
+            llm_provider="cache",
+            llm_model="cache",
+            latency_ms=0.0,
+            sources=list(entry.sources),
+            steps=[
+                AgentStep(
+                    name="cache",
+                    detail=f"served a previous answer, similarity {lookup.similarity:.3f}",
+                    data={"similarity": round(lookup.similarity, 4)},
+                )
+            ],
+            trace_id=trace_id,
+        )
+
+    def _cache_store(self, question: str, result: AgentResult, namespace: str = "default") -> None:
+        if not self.settings.cache.enabled or not result.answer:
+            return
+        try:
+            self.cache.store(
+                question=question,
+                answer=result.answer,
+                embedding=self.rag.embeddings.embed_one(question),
+                sources=result.sources,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            logger.debug("cache store skipped: %s", exc)
+
+    def _projected_spend(self, question: str) -> dict[str, float]:
+        """An upper bound on what this call may consume, before making it.
+
+        The completion is bounded by the configured ``max_tokens`` rather than
+        guessed, so the projection is a ceiling the call cannot exceed rather
+        than an estimate it might. Retrieved context is not known yet at this
+        point, so the prompt side is still a lower bound: this narrows the
+        overshoot to the retrieved passages, it does not remove it.
+        """
+        prompt_tokens = estimate_tokens(question)
+        completion_tokens = self.settings.llm.max_tokens
+        # Priced against the model that will actually serve, not the configured
+        # one. They differ whenever a layer has degraded to its fallback, and
+        # pricing the configured model would then charge a projection against a
+        # model that is not running, or miss the price table entirely.
+        model = getattr(self.llm, "model", "") or self.settings.llm.model
+        usage = self.costs.price(prompt_tokens, completion_tokens, model)
+        return {
+            "projected_tokens": usage.total_tokens,
+            "projected_cost_usd": usage.cost_usd,
+        }
+
+    def _account(self, question: str, result: AgentResult) -> None:
+        """Record token volume and estimated spend for this run."""
+        if not self.settings.cost.enabled:
+            return
+        usage = self.costs.estimate(question, result.answer, result.llm_model)
+        self.costs.record(usage)
+        self.metrics.increment(
+            "zerostack_llm_tokens_total", usage.prompt_tokens, labels={"direction": "prompt"}
+        )
+        self.metrics.increment(
+            "zerostack_llm_tokens_total",
+            usage.completion_tokens,
+            labels={"direction": "completion"},
+        )
+        if usage.cost_usd:
+            self.metrics.increment("zerostack_llm_cost_usd_total", usage.cost_usd)
+        self.metrics.observe("zerostack_llm_seconds", result.latency_ms / 1000.0)
+
+    def ingest(
+        self,
+        path: Path | str | None = None,
+        enforce_roots: bool = True,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
         """Ingest a file or directory into the vector store.
 
         ``enforce_roots`` defaults to True so that every caller is restricted
@@ -117,8 +288,24 @@ class ZerostackApp:
             self._check_ingest_allowed(target)
         if not target.exists():
             raise FileNotFoundError(f"nothing to ingest at {target}")
-        report = self.rag.ingest_path(target)
+        namespace = normalise_namespace(namespace or self.settings.security.default_namespace)
+        report = self.rag.ingest_path(target, namespace=namespace)
+
+        # An answer built from a document that has since changed is worse than no
+        # cache at all, so ingestion drops the entries grounded in what this run
+        # rewrote. Passing every source in the store instead would clear the
+        # whole cache on each ingestion, which makes caching worthless for any
+        # deployment that ingests on a schedule.
+        invalidated = self.cache.invalidate_sources(report.sources) if report.sources else 0
+        # Answers that found nothing carry no source, so the call above cannot
+        # reach them. They are precisely the ones a new document may now answer.
+        if report.chunks:
+            invalidated += self.cache.invalidate_ungrounded(namespace)
+        self.metrics.set_gauge("zerostack_documents_indexed", self.rag.store.count())
+
         return {
+            "cache_entries_invalidated": invalidated,
+            "namespace": namespace,
             "path": str(target),
             "files": report.files,
             "chunks": report.chunks,
@@ -154,6 +341,13 @@ class ZerostackApp:
                     "sqlite_path": str(self.settings.data.sqlite_path),
                     "runs": self.store.count_runs(),
                 },
+                "security": {
+                    **self.principals.describe(),
+                    "rate_limit": self.rate_limiter.snapshot(),
+                    "default_namespace": self.settings.security.default_namespace,
+                },
+                "cost": self.costs.snapshot(),
+                "cache": self.cache.snapshot(),
                 "observability": {
                     "enabled": self.settings.observability.enabled,
                     "export_traces": self.settings.observability.export_traces,
@@ -162,13 +356,54 @@ class ZerostackApp:
             },
         }
 
-    def analytics(self) -> dict[str, Any]:
-        """Aggregate run metrics from the data layer."""
-        return analytics_summary(self.settings.data.sqlite_path)
+    def analytics(self, namespaces: list[str] | None = None) -> dict[str, Any]:
+        """Aggregate run metrics from the data layer.
 
-    def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
-        return self.store.recent_runs(limit=limit)
+        ``namespaces`` restricts the aggregate to a caller's tenants. ``None``
+        means unrestricted and is for a caller holding wildcard access.
+        """
+        return analytics_summary(self.settings.data.sqlite_path, namespaces=namespaces)
+
+    def recent_runs(
+        self, limit: int = 20, namespaces: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        return self.store.recent_runs(limit=limit, namespaces=namespaces)
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Metric values as plain data, for the health endpoint and the UI."""
+        return self.metrics.snapshot()
+
+    def prometheus_metrics(self) -> str:
+        """The registry in Prometheus text exposition format."""
+        return self.metrics.render_prometheus()
 
     def last_trace(self) -> list[dict[str, Any]]:
         """Return the spans recorded by the most recent run."""
         return get_tracer().summary()
+
+
+def _parse_prices(table: str) -> dict[str, tuple[float, float]]:
+    """Parse "model:prompt:completion" entries into a price table.
+
+    A malformed entry is skipped with a warning rather than raising, so one typo
+    in an environment variable cannot stop the application from starting.
+    """
+    prices = dict(DEFAULT_PRICES)
+    for item in (part.strip() for part in table.split(",") if part.strip()):
+        pieces = item.split(":")
+        if len(pieces) != 3:
+            logger.warning("ignoring malformed price entry %r", item)
+            continue
+        model, prompt_price, completion_price = pieces
+        try:
+            prices[model.strip()] = (float(prompt_price), float(completion_price))
+        except ValueError:
+            logger.warning("ignoring price entry with non numeric values %r", item)
+    return prices
+
+
+def _build_principals(settings: SecuritySettings) -> PrincipalStore:
+    """Load principals from a file if given, otherwise from the inline table."""
+    if settings.principals_file:
+        return PrincipalStore.from_file(settings.principals_file)
+    return PrincipalStore.from_json(settings.principals)

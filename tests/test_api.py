@@ -159,3 +159,77 @@ class TestConcurrency:
         runs = client.get("/runs?limit=100").json()["runs"]
         assert len(runs) == 10
         assert len({run["trace_id"] for run in runs}) == 10
+
+
+class TestTelemetryEndpoints:
+    def test_prometheus_endpoint_uses_the_exposition_content_type(self, client):
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
+
+    def test_prometheus_output_carries_type_lines(self, client):
+        client.post("/ingest", json={})
+        client.post("/ask", json={"question": "When does coverage begin?"})
+        assert "# TYPE zerostack_requests_total counter" in client.get("/metrics").text
+
+    def test_metrics_json_mirrors_the_registry(self, client):
+        client.post("/ingest", json={})
+        client.post("/ask", json={"question": "When does coverage begin?"})
+        body = client.get("/metrics.json").json()
+        assert any("zerostack_requests_total" in key for key in body["counters"])
+
+    def test_costs_endpoint_reports_usage(self, client):
+        client.post("/ingest", json={})
+        client.post("/ask", json={"question": "When does coverage begin?"})
+        body = client.get("/costs").json()
+        assert body["calls"] >= 1
+        assert body["tokens_used"] > 0
+
+    def test_health_includes_cost_and_cache(self, client):
+        layers = client.get("/health").json()["layers"]
+        assert "cost" in layers
+        assert "cache" in layers
+
+
+class TestBudgetEnforcement:
+    def test_an_exhausted_budget_returns_429_not_500(self, app, monkeypatch, client):
+        """A ceiling is a throttle, not a server fault."""
+        app.settings.cost.enabled = True
+        app.costs.daily_token_budget = 1
+        app.costs.tokens_used = 100
+
+        client.post("/ingest", json={})
+        response = client.post("/ask", json={"question": "When does coverage begin?"})
+        assert response.status_code == 429
+
+
+class TestCacheBehaviour:
+    def test_a_repeated_question_is_served_from_cache(self, client):
+        client.post("/ingest", json={})
+        question = {"question": "How much can an agent refund without approval?"}
+        first = client.post("/ask", json=question).json()
+        second = client.post("/ask", json=question).json()
+        assert first["llm_provider"] != "cache"
+        assert second["llm_provider"] == "cache"
+
+    def test_a_cached_answer_is_still_recorded(self, client):
+        """A cache hit is still a question somebody asked."""
+        client.post("/ingest", json={})
+        question = {"question": "How much can an agent refund without approval?"}
+        client.post("/ask", json=question)
+        client.post("/ask", json=question)
+        assert len(client.get("/runs?limit=50").json()["runs"]) == 2
+
+    def test_cached_requests_keep_distinct_traces(self, client):
+        client.post("/ingest", json={})
+        question = {"question": "How much can an agent refund without approval?"}
+        first = client.post("/ask", json=question).json()
+        second = client.post("/ask", json=question).json()
+        assert first["trace_id"] != second["trace_id"]
+
+    def test_ingestion_invalidates_the_cache(self, client):
+        client.post("/ingest", json={})
+        question = {"question": "How much can an agent refund without approval?"}
+        client.post("/ask", json=question)
+        client.post("/ingest", json={})
+        assert client.post("/ask", json=question).json()["llm_provider"] != "cache"

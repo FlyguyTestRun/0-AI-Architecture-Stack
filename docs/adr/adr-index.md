@@ -17,3 +17,10 @@ Prefixes:
 | ZS-002 | Qdrant is the default vector store | Accepted |
 | ZS-003 | Both orchestrators sit behind one adapter | Accepted |
 | ZS-004 | Tool access goes through MCP | Accepted |
+| ZS-005 | Retrieval is hybrid by default | Accepted |
+| ZS-006 | A graph tier for questions spread across documents | Accepted |
+| ZS-007 | Enterprise controls are opt in, not a separate edition | Accepted |
+| ZS-008 | Retrieval quality is measured, not assumed | Accepted |
+| ZS-009 | Metered state is bounded and windowed | Accepted |
+| ZS-010 | Boundaries fail closed and travel with the request | Accepted |
+| ZS-011 | Derived state is rebuilt, not appended | Accepted |

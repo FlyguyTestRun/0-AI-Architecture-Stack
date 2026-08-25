@@ -1,7 +1,7 @@
 # Task queue
 
-**Last updated:** 2026-08-24
-**Current phase:** Foundation complete, hardening next
+**Last updated:** 2026-08-25
+**Current phase:** Platform expansion shipped, review findings closed
 **Active mode:** BUILD
 
 ---
@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | AGENTS.md, six modes, five ADRs |
-| Test suite | VALIDATED | 185 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 359 tests, no network, no Docker, no model server |
 
 ---
 
@@ -74,19 +74,44 @@ tokens as they arrive.
 
 Acceptance: the Streamlit app renders tokens incrementally against Ollama.
 
-### 4. Authentication, BLOCKED
+### 4. Authentication, SHIPPED
 
-Blocked on a decision: is the first deployment single tenant or multi tenant? The
-answer changes the data model, not just the middleware.
+Resolved multi tenant. The namespace is the tenancy primitive: every chunk carries
+one, retrieval filters on it, the cache partitions by it, and a principal is granted
+a set of them. See ZS-007.
 
-- Single tenant: an API key check on the FastAPI boundary is enough.
-- Multi tenant: every table needs a tenant column, every query needs a tenant filter,
-  and the vector collection needs per tenant partitioning.
+The namespace grammar is now enforced at both boundaries, so a namespace is an
+identifier rather than free text. See ZS-009 for why that mattered.
 
-Do not start until that is settled. Retrofitting tenancy is far more expensive than
-building it in.
+Still open, and deliberately not started:
 
-### 5. Next.js frontend, PLANNED
+- Per tenant encryption at rest. Needs a key management decision first.
+- An operator facing key rotation flow. The store hashes keys; nothing rotates them.
+
+### 5. Commit authorship cleanup, NEEDS A DECISION
+
+The attribution policy was enforced on file contents and commit messages but not on
+the commit author field, so 17 commits carry an assistant account in the byline. That
+is the most visible place the rule can be broken: the name sits beside every commit
+in the history and on every pull request.
+
+The hook now blocks it and the local identity is set, so nothing new can land that
+way. The existing commits need a decision, because every option rewrites history:
+
+- 13 of the 17 are on the two open branches and are unmerged. Rewriting those is low
+  risk but changes every commit id and needs a force push to two stacked pull
+  requests, which would disrupt a review in progress.
+- 4 are already on the default branch. Rewriting those rewrites shared history.
+
+Recommended: rewrite the two unmerged branches with `git rebase --exec` or a filter,
+before the pull requests merge, and leave the default branch alone unless the
+history is going to be squashed anyway. Doing it after they merge means rewriting
+shared history instead.
+
+Not done unattended: force pushing two stacked pull requests is not reversible from
+the other side of a review.
+
+### 6. Next.js frontend, PLANNED
 
 The API exists for this. Deferred until a project needs a client facing UI.
 
@@ -103,13 +128,91 @@ Recorded rather than hidden.
 | CrewAI engine untested in CI | Needs a live model server | Structurally correct, unverified end to end. Verify before using it on a project |
 | Embedded Qdrant locks its directory | Two local processes conflict | Second process degrades to in process, documented in RUNBOOK |
 | Hashing embeddings are lexical | Offline retrieval misses synonyms | Install the `embeddings` extra |
-| No rate limiting on the API | An open deployment can be exhausted | Add before any public exposure |
-| No authentication on the API | Anyone who can reach it can query the corpus | Ingest is bounded to an allowlist, but auth is still required before exposure |
-| No multi tenancy | One deployment serves one customer | Task 4 above |
+| Rate limiting is per process | Replicas each permit the full rate | Needs a shared limiter before horizontal scaling |
+| Namespace filter is not pushed into the backend | A scoped query over fetches | Correct but not efficient; push down before hundreds of tenants |
+| Graph extraction is deterministic | Finds relation, not relation type | Swap the extractor protocol where a model is available |
+| Existing commits carry an assistant author | 17 commits name one in the byline shown beside every commit and pull request | Needs a decision, see the open item below. New commits are blocked by the hook |
 
 ---
 
 ## Change log
+
+### 2026-08-25, external review round
+
+An automated reviewer raised seven findings against the expansion. One had
+already been fixed independently in the pass below (the daily budget window),
+which is a useful corroboration rather than a duplicate. The other six were
+verified by reproducing each before changing anything, then fixed.
+
+| Finding | Verified how | Fix |
+|---------|--------------|-----|
+| The namespace lived on a process wide context, so concurrent requests crossed tenants | Instrumented at the read: a request asking for `hr` retrieved against `legal` once in eighty | The namespace travels in orchestrator state and the shared field is removed |
+| A broken principal table resolved every caller to a local administrator | Malformed JSON, a missing configured file and an all invalid table each returned open admin access | Supplied but unusable is now a distinct state that refuses everyone |
+| The run log and analytics were not scoped by namespace | An operator restricted to `hr` could read `legal` questions, answers and retrieved text | Runs store their namespace; both endpoints filter by the caller's grant |
+| Re ingesting a document left its superseded graph relations in place | A corrected reporting line returned both the old and the new relation, both cited to the same live source | Upsert rebuilds the affected namespace graph from the store |
+| Cache entries with no sources were never invalidated | A question asked before its document existed kept returning "nothing found" after ingestion | Ingestion also drops ungrounded entries in the target namespace |
+| The spend ceiling projected zero dollars | A short question passed a nearly spent budget and overshot by a full response | The projection bounds the completion at `max_tokens`, priced against the model that will serve |
+
+One bug of my own was caught while fixing these: the run table migration created
+an index on the new column before adding the column, so any database written
+before this change failed to open. Found by testing the migration against a
+legacy database rather than only a fresh one.
+
+Tests 401 to 429. Every fix was reproduced failing first, and each regression
+test was then confirmed to fail against the old behaviour. Recorded as ZS-010
+and ZS-011, with an addendum to ZS-009.
+
+### 2026-08-25, hardening the metered surfaces
+
+Probed the four pieces of state the expansion added that grow with traffic. Each
+was correct on the path it was written for and wrong over months of running.
+Three of the four looked right on the page and were found by measurement.
+
+| Defect | Evidence | Fix |
+|--------|----------|-----|
+| Namespace was never validated, and it reaches a metric label | 5000 namespaces produced 5000 series and 263KB of exposition output, never evicted; a wildcard principal is the default on the offline path | An identifier grammar enforced at the API and again in `ZerostackApp` |
+| Rate limit buckets keyed on the principal name | Two credentials both named `app`, configured 4/min each, received 4 requests between them instead of 8 | Buckets key on `Principal.caller_id()`, derived from the credential |
+| Idle bucket eviction ran on every request | 200 checks against 20k tracked callers took 115ms, growing linearly | Swept on an interval; the same 200 checks now take 0.2ms |
+| The daily budget had no daily window | A tracker that spent its allowance refused every request from then until process restart | Counters roll at the UTC day boundary, under the lock |
+| Ingestion invalidated the cache with every source in the store | Any ingestion dropped every cached answer, so caching was worthless on a schedule | `IngestReport` carries what the run wrote; invalidation uses that |
+
+Tests 359 to 401. Every fix was demonstrated failing before it was written, and
+each regression test was confirmed to fail against the old behaviour rather than
+being assumed to. Recorded as ZS-009.
+
+### 2026-08-25, expansion
+
+Built out the platform for both audiences in one codebase.
+
+| Capability | What it closes |
+|------------|----------------|
+| Hybrid BM25 plus vector retrieval | Exact identifiers were unfindable by a purely semantic index |
+| Graph retrieval tier | Questions whose answer spans documents that never reference each other |
+| Metrics and Prometheus endpoint | Traces described one request; nothing described the fleet |
+| Token accounting and spend ceilings | A local model has no invoice, so cost was invisible until it was not |
+| Semantic answer cache | Repeated questions re-ran the whole pipeline |
+| Identity, roles and namespaces | No way to serve more than one tenant or restrict who sees what |
+| Rate limiting | An endpoint that runs a model on every call is a denial of wallet |
+| Evaluation harness and CI gate | Quality regressions merged silently, since retrieval failure raises nothing |
+
+Defects found and fixed while building, each now covered:
+
+- Fusion bypassed the relevance cutoff, so fused results reported sources that
+  had not grounded the answer. The cutoff now applies to every mode.
+- Graph scaffolding was scored as content by the extractive provider, exactly as
+  citation headers had been, so labels outranked the sentences they introduced.
+- A sentence reaching the context twice, as a passage and as graph evidence, was
+  answered twice verbatim. Sentences are now deduplicated.
+- Cache hits returned before persistence, silently emptying the audit trail the
+  moment caching was enabled, and left concurrent callers indistinguishable.
+- Rate limiting was applied only to ask and ingest, leaving the observability
+  endpoints unbounded. It now sits in the authentication dependency.
+- The evaluation harness found two questions retrieving the right document and
+  omitting the answering sentence. The extractive window moved from four to six.
+
+Known limits recorded rather than hidden: namespace filtering is applied after
+the search rather than pushed into the backend, rate limiting is per process, and
+graph extraction finds that entities are related but not how.
 
 ### 2026-08-24, fifth pass
 

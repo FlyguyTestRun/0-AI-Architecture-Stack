@@ -1,0 +1,54 @@
+{
+  "name": "baseline",
+  "cases": [
+    {
+      "question": "How much can a support agent refund without approval?",
+      "expected_sources": ["support-runbook.md"],
+      "expected_phrases": ["two hundred dollars"],
+      "tags": ["retrieval", "policy"]
+    },
+    {
+      "question": "How long is the probationary period?",
+      "expected_sources": ["onboarding-policy.md"],
+      "expected_phrases": ["ninety day"],
+      "tags": ["retrieval", "policy"]
+    },
+    {
+      "question": "What must a postmortem contain?",
+      "expected_sources": ["support-runbook.md"],
+      "expected_phrases": ["timeline", "root cause"],
+      "tags": ["retrieval", "process"]
+    },
+    {
+      "question": "When does benefits enrollment coverage begin?",
+      "expected_sources": ["onboarding-policy.md"],
+      "expected_phrases": ["first day of the month"],
+      "tags": ["retrieval", "benefits"]
+    },
+    {
+      "question": "What is the severity 1 response target?",
+      "expected_sources": ["support-runbook.md"],
+      "expected_phrases": ["fifteen minutes"],
+      "tags": ["retrieval", "process"]
+    },
+    {
+      "question": "Who approves a refund above two thousand dollars?",
+      "expected_sources": ["support-runbook.md"],
+      "expected_phrases": ["finance"],
+      "tags": ["retrieval", "policy"]
+    },
+    {
+      "question": "What is (120 * 3) / 4?",
+      "expected_sources": [],
+      "expected_phrases": ["90"],
+      "tags": ["tools", "arithmetic"]
+    },
+    {
+      "question": "What is the airspeed velocity of an unladen swallow?",
+      "expected_sources": [],
+      "expected_phrases": [],
+      "forbidden_phrases": ["two hundred dollars", "ninety day"],
+      "tags": ["grounding", "out-of-corpus"]
+    }
+  ]
+}

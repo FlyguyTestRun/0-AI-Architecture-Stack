@@ -58,3 +58,6 @@ ignore = ["E501"]
 # Typer's documented idiom is to call typer.Argument/typer.Option in the default,
 # so B008 is a false positive for the CLI module.
 "src/zerostack/cli.py" = ["B008"]
+# FastAPI's documented idiom is Depends() in the parameter default, so B008 is a
+# false positive for the API module in exactly the same way.
+"src/zerostack/api/main.py" = ["B008"]

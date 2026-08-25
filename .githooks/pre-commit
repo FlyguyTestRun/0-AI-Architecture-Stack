@@ -52,6 +52,26 @@ if [ "$violations" -gt 0 ]; then
   exit 1
 fi
 
+# ADR GLOBAL-001 covers the commit's own author field too. An assistant account
+# in the author slot credits one as plainly as a trailer does, and it is the name
+# shown beside every commit in the history and on every pull request, which is
+# the most visible place the rule can be broken. Matched by shape, as above.
+#
+# A github user noreply address belongs to a person, so it is stripped before the
+# vendor noreply test rather than being flagged.
+author_ident="$(git var GIT_AUTHOR_IDENT)"
+author_probe="${author_ident//@users.noreply.github.com/}"
+author_re='(^|[^[:alnum:]])(bot|assistant|copilot|\[ai\])([^[:alnum:]]|$)|noreply@'
+if printf '%s' "$author_probe" | grep -qEi "$author_re"; then
+  echo "pre-commit: the commit author reads as an assistant account:"
+  echo "    $author_ident"
+  echo "pre-commit: set a human author with:"
+  echo "    git config user.name \"Your Name\""
+  echo "    git config user.email \"you@example.com\""
+  echo "pre-commit: blocked by the attribution policy (ADR GLOBAL-001)"
+  exit 1
+fi
+
 if [ -x .venv/bin/ruff ]; then
   .venv/bin/ruff check src tests apps
 fi

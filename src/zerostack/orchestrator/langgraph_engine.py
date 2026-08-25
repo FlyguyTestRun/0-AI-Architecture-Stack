@@ -55,13 +55,13 @@ class LangGraphOrchestrator:
 
         return builder.compile()
 
-    def run(self, question: str) -> AgentResult:
+    def run(self, question: str, namespace: str = "default") -> AgentResult:
         tracer = get_tracer()
         trace_id = tracer.new_trace()
         start = time.perf_counter()
 
         with tracer.span("orchestrator.run", engine=self.name, question=question):
-            state = self._graph.invoke(initial_state(question))
+            state = self._graph.invoke(initial_state(question, namespace))
 
         return AgentResult(
             answer=state["answer"],
