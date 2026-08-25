@@ -503,3 +503,101 @@ class TestLimiterScaling:
             time.sleep(0.03)
             limiter.check("busy")
         assert limiter.snapshot()["tracked_callers"] == 1
+
+
+class TestFailClosedPrincipals:
+    """A principal table that was supplied but cannot be used must not open up.
+
+    An empty store means "no authentication configured", which is the correct
+    default for one machine. A broken store means an operator was configuring
+    authentication and got it wrong. Collapsing the second into the first turns a
+    typo, or a secret that failed to mount, into open admin access.
+    """
+
+    def test_malformed_json_refuses_everyone(self):
+        store = PrincipalStore.from_json('{"zs_key": {"name": "app", ')
+        with pytest.raises(UnauthorizedError):
+            store.resolve(None)
+
+    def test_malformed_json_refuses_a_presented_key_too(self):
+        store = PrincipalStore.from_json('{"zs_key": {"name": "app", ')
+        with pytest.raises(UnauthorizedError):
+            store.resolve("zs_key")
+
+    def test_a_configured_file_that_is_missing_refuses_everyone(self, tmp_path):
+        """The secret that did not mount is exactly this case."""
+        store = PrincipalStore.from_file(tmp_path / "never-written.json")
+        with pytest.raises(UnauthorizedError):
+            store.resolve(None)
+
+    def test_a_table_where_every_entry_is_invalid_refuses_everyone(self):
+        store = PrincipalStore.from_json('{"zs_key": {"role": "not-a-role"}}')
+        with pytest.raises(UnauthorizedError):
+            store.resolve(None)
+
+    def test_a_partially_valid_table_still_works(self):
+        """One bad entry must not lock out the good ones."""
+        store = PrincipalStore.from_json(
+            json.dumps(
+                {
+                    "zs_good": {"name": "app", "role": "reader"},
+                    "zs_bad": {"name": "broken", "role": "not-a-role"},
+                }
+            )
+        )
+        assert store.resolve("zs_good").name == "app"
+
+    def test_no_table_configured_is_still_open(self):
+        """The single machine path must not need credentials."""
+        assert PrincipalStore.from_json("").resolve(None).name == "local"
+
+    def test_health_reports_the_failed_state(self):
+        store = PrincipalStore.from_json("{not json")
+        described = store.describe()
+        assert described["authentication"] == "failed closed (misconfigured)"
+        assert described["principals"] == 0
+
+
+class TestOperationalDataIsScoped:
+    """The run log carries questions, answers and retrieved document text."""
+
+    @pytest.fixture
+    def populated(self, settings, corpus_dir, tmp_path):
+        settings.rag.corpus_dir = corpus_dir
+        settings.data.sqlite_path = tmp_path / "runs.db"
+        settings.cache.enabled = False
+        instance = ZerostackApp(settings=settings, include_mcp=False)
+        instance.ingest(str(corpus_dir), namespace="hr", enforce_roots=False)
+        instance.ingest(str(corpus_dir), namespace="legal", enforce_roots=False)
+        instance.ask("How long is the probationary period?", namespace="hr")
+        instance.ask("How long is the probationary period?", namespace="legal")
+        return instance
+
+    def test_a_wildcard_operator_sees_every_run(self, populated):
+        assert len(populated.recent_runs(namespaces=None)) == 2
+
+    def test_a_scoped_operator_sees_only_its_own(self, populated):
+        runs = populated.recent_runs(namespaces=["hr"])
+        assert [run["namespace"] for run in runs] == ["hr"]
+
+    def test_a_principal_with_no_namespaces_sees_nothing(self, populated):
+        """An empty scope must restrict to nothing, never to everything."""
+        assert populated.recent_runs(namespaces=[]) == []
+
+    def test_analytics_is_scoped_the_same_way(self, populated):
+        assert populated.analytics(namespaces=None)["runs"] == 2
+        assert populated.analytics(namespaces=["hr"])["runs"] == 1
+        assert populated.analytics(namespaces=[])["runs"] == 0
+
+    def test_the_api_scopes_the_run_log_to_the_caller(self, secured_client, keys):
+        secured_client.post(
+            "/ask", json={"question": "refund", "namespace": "hr"}, headers=header(keys["writer"])
+        )
+        response = secured_client.get("/runs", headers=header(keys["operator"]))
+        assert response.status_code == 200
+
+    def test_visible_namespaces_is_none_only_for_a_wildcard(self):
+        from zerostack.api.main import visible_namespaces
+
+        assert visible_namespaces(Principal(name="a", namespaces=[ALL_NAMESPACES])) is None
+        assert visible_namespaces(Principal(name="b", namespaces=["hr"])) == ["hr"]

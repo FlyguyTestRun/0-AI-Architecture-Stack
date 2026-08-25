@@ -182,8 +182,17 @@ class PrincipalStore:
     output states plainly which mode is active rather than leaving it implied.
     """
 
-    def __init__(self, principals: dict[str, Principal] | None = None) -> None:
+    def __init__(
+        self,
+        principals: dict[str, Principal] | None = None,
+        misconfigured: str = "",
+    ) -> None:
         self._by_hash: dict[str, Principal] = dict(principals or {})
+        # Non empty when a principal table was supplied and could not be used.
+        # That is a different state from "none supplied" and must not resolve to
+        # the same open access, or a typo in the table silently unlocks the
+        # deployment that was configuring authentication.
+        self.misconfigured = misconfigured
 
     @property
     def enabled(self) -> bool:
@@ -208,6 +217,11 @@ class PrincipalStore:
         namespace, which is what makes the single machine path work with no
         configuration at all.
         """
+        if self.misconfigured:
+            # Fail closed. An operator who configured a table and got it wrong
+            # wanted authentication, so the safe reading of a broken table is
+            # "nobody gets in" rather than "everybody does".
+            raise UnauthorizedError("the principal table could not be loaded")
         if not self.enabled:
             return Principal(
                 name="local",
@@ -241,7 +255,7 @@ class PrincipalStore:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             logger.error("could not parse the principal table: %s", exc)
-            return cls()
+            return cls(misconfigured=f"the principal table is not valid JSON: {exc}")
 
         store = cls()
         for raw_key, spec in (payload or {}).items():
@@ -263,19 +277,39 @@ class PrincipalStore:
                 logger.warning("skipping principal %r: %s", spec.get("name", raw_key), exc)
                 continue
             store.add(str(raw_key), principal)
+
+        if not store.enabled:
+            # Something was supplied but nothing usable came out of it, so every
+            # entry was skipped. Same reasoning as unparseable JSON.
+            store.misconfigured = "the principal table contained no usable entries"
         return store
 
     @classmethod
     def from_file(cls, path: Path) -> PrincipalStore:
+        """Load a principal table from a file that was explicitly configured.
+
+        Naming a file is itself the intent to authenticate, so a missing or
+        unreadable one fails closed. A secret that did not mount is the exact
+        case this protects: the file is absent, and treating absence as "no
+        authentication wanted" would open the deployment at the worst moment.
+        """
         if not path.exists():
-            return cls()
+            logger.error("the configured principal file does not exist: %s", path)
+            return cls(misconfigured=f"the principal file {path} does not exist")
         try:
             return cls.from_json(path.read_text(encoding="utf-8"))
         except OSError as exc:
             logger.error("could not read the principal file %s: %s", path, exc)
-            return cls()
+            return cls(misconfigured=f"the principal file {path} could not be read")
 
     def describe(self) -> dict[str, object]:
+        if self.misconfigured:
+            return {
+                "authentication": "failed closed (misconfigured)",
+                "detail": self.misconfigured,
+                "principals": 0,
+                "roles": [],
+            }
         return {
             "authentication": "enabled" if self.enabled else "disabled (open access)",
             "principals": self.count,
