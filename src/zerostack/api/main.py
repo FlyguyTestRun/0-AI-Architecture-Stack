@@ -84,6 +84,19 @@ def require(principal: Principal, role: Role) -> None:
         )
 
 
+def visible_namespaces(principal: Principal) -> list[str] | None:
+    """The namespaces a principal may see in operational data.
+
+    ``None`` means unrestricted, and is returned only for a wildcard grant. The
+    run log and the analytics aggregate carry questions, answers and retrieved
+    document text, so an operator scoped to one tenant must not read another's
+    through them.
+    """
+    if principal.sees_all_namespaces():
+        return None
+    return [normalise_namespace(entry) for entry in principal.namespaces]
+
+
 def resolve_namespace(principal: Principal, requested: str | None) -> str:
     """Pick the namespace for a request and confirm the caller may use it."""
     try:
@@ -196,14 +209,14 @@ def runs(limit: int = 20, principal: Principal = Depends(authenticate)) -> dict[
     """Return recent agent runs from the data layer."""
     require(principal, Role.OPERATOR)
     limit = max(1, min(limit, 200))
-    return {"runs": get_app().recent_runs(limit=limit)}
+    return {"runs": get_app().recent_runs(limit=limit, namespaces=visible_namespaces(principal))}
 
 
 @api.get("/analytics")
 def analytics(principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Aggregate run metrics."""
     require(principal, Role.OPERATOR)
-    return get_app().analytics()
+    return get_app().analytics(namespaces=visible_namespaces(principal))
 
 
 @api.get("/metrics", response_class=Response)

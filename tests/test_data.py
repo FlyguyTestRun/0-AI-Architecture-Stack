@@ -83,3 +83,71 @@ class TestAnalytics:
         assert simple["runs"] == 2
         assert simple["avg_latency_ms"] == 20.0
         assert simple["max_latency_ms"] == 30.0
+
+
+class TestNamespaceMigration:
+    """A database written before the tenancy work must keep working."""
+
+    @staticmethod
+    def _legacy_database(path):
+        import sqlite3
+
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY, trace_id TEXT, question TEXT NOT NULL,
+              answer TEXT NOT NULL, orchestrator TEXT NOT NULL,
+              llm_provider TEXT NOT NULL, llm_model TEXT NOT NULL,
+              latency_ms REAL NOT NULL, sources TEXT NOT NULL DEFAULT '[]',
+              steps TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL);
+            INSERT INTO runs VALUES
+              ('old1','t','q','a','simple','offline','m',1.0,'[]','[]','2026-01-01');
+            """
+        )
+        connection.commit()
+        connection.close()
+
+    def test_the_column_is_added_to_an_existing_table(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        self._legacy_database(path)
+        store = StateStore(path)
+        with store.connect() as connection:
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+        assert "namespace" in columns
+
+    def test_existing_rows_survive_and_take_the_default(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        self._legacy_database(path)
+        store = StateStore(path)
+        rows = store.recent_runs(namespaces=None)
+        assert [row["id"] for row in rows] == ["old1"]
+        assert rows[0]["namespace"] == "default"
+
+    def test_a_fresh_database_gets_the_column_directly(self, tmp_path):
+        store = StateStore(tmp_path / "fresh.db")
+        with store.connect() as connection:
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+        assert "namespace" in columns
+
+    def test_scoped_reads_work_after_migrating(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        self._legacy_database(path)
+        store = StateStore(path)
+        store.save_run(
+            RunRecord(
+                question="q2",
+                answer="a2",
+                orchestrator="simple",
+                llm_provider="offline",
+                llm_model="m",
+                latency_ms=1.0,
+                namespace="hr",
+            )
+        )
+        assert [row["id"] for row in store.recent_runs(namespaces=["default"])] == ["old1"]
+        assert len(store.recent_runs(namespaces=["hr"])) == 1
