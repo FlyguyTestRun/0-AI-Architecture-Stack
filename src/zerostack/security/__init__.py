@@ -8,20 +8,30 @@ turns every boundary on at once.
 """
 
 from zerostack.security.identity import (
+    ALL_NAMESPACES,
+    DEFAULT_NAMESPACE,
     ForbiddenError,
+    InvalidNamespace,
     Principal,
     PrincipalStore,
     Role,
     UnauthorizedError,
+    normalise_grant,
+    normalise_namespace,
 )
 from zerostack.security.limits import RateLimiter, RateLimitExceeded
 
 __all__ = [
+    "ALL_NAMESPACES",
+    "DEFAULT_NAMESPACE",
     "ForbiddenError",
+    "InvalidNamespace",
     "Principal",
     "PrincipalStore",
     "RateLimitExceeded",
     "RateLimiter",
     "Role",
     "UnauthorizedError",
+    "normalise_grant",
+    "normalise_namespace",
 ]

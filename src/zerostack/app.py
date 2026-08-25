@@ -31,7 +31,7 @@ from zerostack.orchestrator import (
 )
 from zerostack.orchestrator.factory import available_engines
 from zerostack.rag import RAGPipeline
-from zerostack.security import PrincipalStore, RateLimiter
+from zerostack.security import PrincipalStore, RateLimiter, normalise_namespace
 from zerostack.tools import build_registry
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,10 @@ class ZerostackApp:
             raise ValueError("question must not be empty")
         question = question.strip()
 
-        namespace = namespace or self.settings.security.default_namespace
+        # Normalised before it reaches a metric label, a cache partition or a
+        # retrieval filter. The API validates too, but the CLI and the frontend
+        # call straight into here, so the guarantee has to live at this level.
+        namespace = normalise_namespace(namespace or self.settings.security.default_namespace)
         self.metrics.increment("zerostack_requests_total", labels={"namespace": namespace})
 
         cached = self._cache_lookup(question, namespace) if use_cache else None
@@ -260,16 +263,15 @@ class ZerostackApp:
             self._check_ingest_allowed(target)
         if not target.exists():
             raise FileNotFoundError(f"nothing to ingest at {target}")
-        namespace = namespace or self.settings.security.default_namespace
+        namespace = normalise_namespace(namespace or self.settings.security.default_namespace)
         report = self.rag.ingest_path(target, namespace=namespace)
 
         # An answer built from a document that has since changed is worse than no
-        # cache at all, so ingestion drops exactly the entries it invalidates.
-        invalidated = (
-            self.cache.invalidate_sources([chunk.source for chunk in self.rag.store.iter_chunks()])
-            if report.chunks
-            else 0
-        )
+        # cache at all, so ingestion drops the entries grounded in what this run
+        # rewrote. Passing every source in the store instead would clear the
+        # whole cache on each ingestion, which makes caching worthless for any
+        # deployment that ingests on a schedule.
+        invalidated = self.cache.invalidate_sources(report.sources) if report.sources else 0
         self.metrics.set_gauge("zerostack_documents_indexed", self.rag.store.count())
 
         return {

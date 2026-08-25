@@ -73,6 +73,7 @@ class RateLimiter:
         self.idle_eviction_seconds = idle_eviction_seconds
         self._buckets: dict[str, Bucket] = {}
         self._lock = threading.Lock()
+        self._last_eviction = time.monotonic()
 
     @property
     def enabled(self) -> bool:
@@ -111,9 +112,25 @@ class RateLimiter:
             )
 
     def _evict_idle(self) -> None:
+        """Drop buckets nobody has touched lately.
+
+        Swept on an interval rather than on every call. The scan is linear in
+        the number of tracked callers, so running it per request made the cost
+        of admitting one request grow with the size of the caller table: at
+        twenty thousand callers that was most of the time spent in the limiter,
+        and it grew without bound. Sweeping periodically keeps the eviction
+        guarantee while making the common path constant time.
+        """
         if not self.idle_eviction_seconds:
             return
-        cutoff = time.monotonic() - self.idle_eviction_seconds
+        now = time.monotonic()
+        # A tenth of the idle window: often enough that an evictable bucket is
+        # never held much beyond its deadline, rare enough to stay off the hot
+        # path.
+        if now - self._last_eviction < self.idle_eviction_seconds / 10.0:
+            return
+        self._last_eviction = now
+        cutoff = now - self.idle_eviction_seconds
         for key in [k for k, b in self._buckets.items() if b.updated_at < cutoff]:
             del self._buckets[key]
 

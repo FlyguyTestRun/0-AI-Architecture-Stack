@@ -17,10 +17,12 @@ from pydantic import BaseModel, Field
 from zerostack.app import ZerostackApp
 from zerostack.observability import BudgetExceeded
 from zerostack.security import (
+    InvalidNamespace,
     Principal,
     RateLimitExceeded,
     Role,
     UnauthorizedError,
+    normalise_namespace,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ def get_app() -> ZerostackApp:
 
 def enforce_rate_limit(principal: Principal) -> None:
     try:
-        get_app().rate_limiter.check(principal.name, principal.requests_per_minute)
+        get_app().rate_limiter.check(principal.caller_id(), principal.requests_per_minute)
     except RateLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -84,7 +86,13 @@ def require(principal: Principal, role: Role) -> None:
 
 def resolve_namespace(principal: Principal, requested: str | None) -> str:
     """Pick the namespace for a request and confirm the caller may use it."""
-    namespace = requested or principal.default_namespace()
+    try:
+        namespace = normalise_namespace(requested or principal.default_namespace())
+    except InvalidNamespace as exc:
+        # Rejected before the permission check, because an unconstrained
+        # namespace reaches a metric label and a cache partition even when the
+        # caller holds the wildcard grant that would otherwise wave it through.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not principal.may_access(namespace):
         # Refusing without confirming whether the namespace exists keeps the
         # boundary from doubling as a directory of other tenants.

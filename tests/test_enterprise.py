@@ -9,6 +9,7 @@ open, and the configured path actually enforces.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,12 +22,16 @@ from zerostack.rag.embeddings import HashingEmbeddings
 from zerostack.rag.pipeline import RAGPipeline
 from zerostack.rag.store import MemoryVectorStore
 from zerostack.security import (
+    ALL_NAMESPACES,
+    InvalidNamespace,
     Principal,
     PrincipalStore,
     RateLimiter,
     RateLimitExceeded,
     Role,
     UnauthorizedError,
+    normalise_grant,
+    normalise_namespace,
 )
 from zerostack.security.identity import generate_key, hash_key
 
@@ -314,3 +319,187 @@ class TestOpenModeIsUnchanged:
     def test_health_states_that_authentication_is_off(self, open_client):
         security = open_client.get("/health").json()["layers"]["security"]
         assert "disabled" in security["authentication"]
+
+
+class TestNamespaceValidation:
+    """A namespace is an identifier, not free text.
+
+    It reaches a metric label, a cache partition and a retrieval filter, so an
+    unconstrained one lets any caller holding the wildcard grant mint a new
+    metric series on every request until the process runs out of memory.
+    """
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("hr", "hr"),
+            ("HR", "hr"),
+            ("  Legal  ", "legal"),
+            ("client-acme", "client-acme"),
+            ("a_b", "a_b"),
+            (None, "default"),
+            ("", "default"),
+            ("   ", "default"),
+        ],
+    )
+    def test_well_formed_namespaces_are_canonicalised(self, value, expected):
+        assert normalise_namespace(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        ["*", "x" * 64, "a\nb", "../etc", "-lead", "ns!", "a b", "Ünicode"],
+    )
+    def test_malformed_namespaces_are_refused(self, value):
+        with pytest.raises(InvalidNamespace):
+            normalise_namespace(value)
+
+    def test_case_only_variants_are_one_tenant(self):
+        """Two partitions that read as one to a human are a tenancy hazard."""
+        assert normalise_namespace("Finance") == normalise_namespace("finance")
+
+    def test_the_wildcard_is_a_grant_not_a_target(self):
+        assert normalise_grant("*") == ALL_NAMESPACES
+        with pytest.raises(InvalidNamespace):
+            normalise_namespace("*")
+
+    def test_a_grant_is_canonicalised_too(self):
+        """Otherwise a table saying "HR" would never match a request for "hr"."""
+        store = PrincipalStore.from_json(
+            json.dumps({"zs_k": {"name": "app", "role": "reader", "namespaces": ["HR", " Legal "]}})
+        )
+        principal = store.resolve("zs_k")
+        assert principal.namespaces == ["hr", "legal"]
+        assert principal.may_access("hr")
+
+
+class TestNamespaceValidationAtTheBoundary:
+    def test_the_api_refuses_a_malformed_namespace(self, secured_client, keys):
+        response = secured_client.post(
+            "/ask",
+            json={"question": "x", "namespace": "a b!"},
+            headers=header(keys["operator"]),
+        )
+        assert response.status_code == 422
+
+    def test_a_wildcard_principal_cannot_mint_unbounded_namespaces(self, secured_client, keys):
+        """The wildcard grant waves through the permission check, so the shape
+        check has to run before it."""
+        response = secured_client.post(
+            "/ask",
+            json={"question": "x", "namespace": "n" * 200},
+            headers=header(keys["operator"]),
+        )
+        assert response.status_code == 422
+
+    def test_metric_labels_stay_bounded(self, secured_client, keys):
+        """One tenant asking under many spellings is still one metric series."""
+        app = api_module._app_instance
+        before = len(app.metrics._counters)
+        for spelling in ["hr", "HR", "  hr  ", "Hr"]:
+            secured_client.post(
+                "/ask",
+                json={"question": "x", "namespace": spelling},
+                headers=header(keys["operator"]),
+            )
+        assert len(app.metrics._counters) - before <= 1
+
+    def test_the_ingest_path_validates_too(self, secured_client, keys):
+        """Otherwise an invalid namespace reaches the generic handler as a 500."""
+        response = secured_client.post(
+            "/ingest", json={"namespace": "../escape"}, headers=header(keys["operator"])
+        )
+        assert response.status_code == 422
+
+    def test_the_library_boundary_validates(self, settings, corpus_dir):
+        """The CLI and the frontend call straight into the app, not the API."""
+        settings.rag.corpus_dir = corpus_dir
+        instance = ZerostackApp(settings=settings, include_mcp=False)
+        with pytest.raises(InvalidNamespace):
+            instance.ask("anything", namespace="not a namespace")
+
+
+class TestCallerIdentity:
+    """A rate limit bucket must be keyed on the credential, not on its label.
+
+    The name is an operator chosen string and nothing stops two entries sharing
+    one. Keying a meter on it pools two distinct credentials into a single
+    allowance, so each silently receives half of what it was configured.
+    """
+
+    def test_two_credentials_sharing_a_name_are_distinct_callers(self):
+        store = PrincipalStore.from_json(
+            json.dumps(
+                {
+                    "zs_key_one": {"name": "app", "role": "reader"},
+                    "zs_key_two": {"name": "app", "role": "reader"},
+                }
+            )
+        )
+        first = store.resolve("zs_key_one")
+        second = store.resolve("zs_key_two")
+        assert first.name == second.name
+        assert first.caller_id() != second.caller_id()
+
+    def test_each_credential_gets_its_own_allowance(self):
+        store = PrincipalStore.from_json(
+            json.dumps(
+                {
+                    "zs_key_one": {"name": "app", "role": "reader", "requests_per_minute": 4},
+                    "zs_key_two": {"name": "app", "role": "reader", "requests_per_minute": 4},
+                }
+            )
+        )
+        first = store.resolve("zs_key_one")
+        second = store.resolve("zs_key_two")
+        limiter = RateLimiter(requests_per_minute=4)
+        allowed = 0
+        for index in range(8):
+            caller = first if index % 2 == 0 else second
+            try:
+                limiter.check(caller.caller_id(), caller.requests_per_minute)
+                allowed += 1
+            except RateLimitExceeded:
+                pass
+        assert allowed == 8
+
+    def test_open_mode_still_has_a_usable_identity(self):
+        """With no principals configured there is one implicit local caller."""
+        principal = PrincipalStore().resolve(None)
+        assert principal.caller_id() == "local"
+
+    def test_the_identity_is_not_the_raw_key(self):
+        store = PrincipalStore()
+        store.add("zs_supersecret", Principal(name="app"))
+        principal = store.resolve("zs_supersecret")
+        assert "zs_supersecret" not in principal.caller_id()
+
+
+class TestLimiterScaling:
+    def test_eviction_is_off_the_hot_path(self):
+        """Sweeping on every call made admitting one request cost O(callers)."""
+        limiter = RateLimiter(requests_per_minute=600)
+        for index in range(5000):
+            limiter.check(f"caller-{index}")
+        start = time.perf_counter()
+        for _ in range(200):
+            limiter.check("caller-0")
+        elapsed = time.perf_counter() - start
+        # Generous: the per call scan cost roughly 0.5ms per request at this
+        # table size, so 200 calls took over a tenth of a second.
+        assert elapsed < 0.05, f"200 checks took {elapsed:.3f}s against 5000 callers"
+
+    def test_idle_buckets_are_still_evicted(self):
+        limiter = RateLimiter(requests_per_minute=60, idle_eviction_seconds=0.05)
+        limiter.check("goes-idle")
+        assert limiter.snapshot()["tracked_callers"] == 1
+        time.sleep(0.12)
+        limiter.check("still-here")
+        assert limiter.snapshot()["tracked_callers"] == 1
+
+    def test_an_active_bucket_is_not_evicted(self):
+        limiter = RateLimiter(requests_per_minute=600, idle_eviction_seconds=0.05)
+        limiter.check("busy")
+        for _ in range(5):
+            time.sleep(0.03)
+            limiter.check("busy")
+        assert limiter.snapshot()["tracked_callers"] == 1

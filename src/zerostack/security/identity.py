@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -28,6 +29,53 @@ logger = logging.getLogger(__name__)
 DEFAULT_NAMESPACE = "default"
 # A namespace value meaning "every namespace this principal could ever see".
 ALL_NAMESPACES = "*"
+
+# A namespace is an identifier, not free text. Constraining it is not cosmetic:
+# the namespace reaches a metric label, a cache partition and a retrieval
+# filter, and an unconstrained one lets a caller mint a new series on every
+# request until the process runs out of memory. Sixty three characters is the
+# usual label length ceiling and is far more than a tenant name needs.
+NAMESPACE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+MAX_NAMESPACE_LENGTH = 63
+
+
+class InvalidNamespace(ValueError):
+    """A namespace that is not a well formed identifier."""
+
+
+def normalise_namespace(value: str | None) -> str:
+    """Return ``value`` as a canonical namespace, or raise.
+
+    Case is folded because two tenants differing only in case are two storage
+    partitions that read as one to a human, which is the kind of ambiguity a
+    tenancy boundary must not have. The wildcard is rejected here because it is
+    a grant a principal holds, never a namespace documents live in: accepting it
+    as a target would silently address a partition that can never match.
+    """
+    # Stripped before the emptiness test so a blank field and an absent one are
+    # the same request. A form that posts "   " means "I did not choose".
+    candidate = (value or "").strip().lower() or DEFAULT_NAMESPACE
+    if candidate == ALL_NAMESPACES:
+        raise InvalidNamespace("the wildcard is a grant, not a namespace")
+    if not NAMESPACE_PATTERN.fullmatch(candidate):
+        raise InvalidNamespace(
+            "a namespace must be 1 to "
+            f"{MAX_NAMESPACE_LENGTH} characters of a-z, 0-9, hyphen or underscore, "
+            "starting with a letter or digit"
+        )
+    return candidate
+
+
+def normalise_grant(value: str) -> str:
+    """Return ``value`` as a namespace a principal may be granted.
+
+    Unlike a request target this accepts the wildcard, because granting "every
+    namespace" is exactly what an administrator credential needs to express.
+    """
+    candidate = value.strip().lower()
+    if candidate == ALL_NAMESPACES:
+        return ALL_NAMESPACES
+    return normalise_namespace(candidate)
 
 
 class UnauthorizedError(RuntimeError):
@@ -68,6 +116,11 @@ class Principal:
 
     name: str
     role: Role = Role.READER
+    # Set by the store from the credential itself. The name is a label an
+    # operator chooses and may reuse; anything keyed on it (a rate limit bucket,
+    # a per caller budget) would silently pool two distinct credentials into one
+    # allowance. This is derived from the key hash, so it is unique per key.
+    key_id: str = ""
     namespaces: list[str] = field(default_factory=lambda: [DEFAULT_NAMESPACE])
     # Per principal ceilings. Zero means "use the deployment default".
     requests_per_minute: int = 0
@@ -87,6 +140,14 @@ class Principal:
         if self.sees_all_namespaces():
             return DEFAULT_NAMESPACE
         return self.namespaces[0] if self.namespaces else DEFAULT_NAMESPACE
+
+    def caller_id(self) -> str:
+        """The key for anything that meters this caller.
+
+        Falls back to the name only in open mode, where there is one implicit
+        local principal and therefore nothing to confuse it with.
+        """
+        return self.key_id or self.name
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -133,7 +194,12 @@ class PrincipalStore:
         return len(self._by_hash)
 
     def add(self, raw_key: str, principal: Principal) -> None:
-        self._by_hash[hash_key(raw_key)] = principal
+        digest = hash_key(raw_key)
+        # Truncated so the identity can appear in a log line or a bucket table
+        # without carrying the full stored hash around. Sixty four bits is far
+        # beyond collision range for a hand written principal table.
+        principal.key_id = digest[:16]
+        self._by_hash[digest] = principal
 
     def resolve(self, raw_key: str | None) -> Principal:
         """Return the principal for a key, or raise.
@@ -186,7 +252,10 @@ class PrincipalStore:
                 principal = Principal(
                     name=str(spec.get("name", "unnamed")),
                     role=Role(str(spec.get("role", "reader"))),
-                    namespaces=list(spec.get("namespaces") or [DEFAULT_NAMESPACE]),
+                    namespaces=[
+                        normalise_grant(str(entry))
+                        for entry in (spec.get("namespaces") or [DEFAULT_NAMESPACE])
+                    ],
                     requests_per_minute=int(spec.get("requests_per_minute", 0)),
                     daily_token_budget=int(spec.get("daily_token_budget", 0)),
                 )
