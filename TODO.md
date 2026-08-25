@@ -35,7 +35,7 @@
 | Streamlit frontend | IMPLEMENTED | Not covered by automated tests, see below |
 | Docker Compose, Makefile, CI | VALIDATED | Qdrant, Ollama, Phoenix; CI runs with no services |
 | Governance docs and ADRs | VALIDATED | AGENTS.md, six modes, five ADRs |
-| Test suite | VALIDATED | 185 tests, no network, no Docker, no model server |
+| Test suite | VALIDATED | 359 tests, no network, no Docker, no model server |
 
 ---
 
@@ -103,13 +103,47 @@ Recorded rather than hidden.
 | CrewAI engine untested in CI | Needs a live model server | Structurally correct, unverified end to end. Verify before using it on a project |
 | Embedded Qdrant locks its directory | Two local processes conflict | Second process degrades to in process, documented in RUNBOOK |
 | Hashing embeddings are lexical | Offline retrieval misses synonyms | Install the `embeddings` extra |
-| No rate limiting on the API | An open deployment can be exhausted | Add before any public exposure |
-| No authentication on the API | Anyone who can reach it can query the corpus | Ingest is bounded to an allowlist, but auth is still required before exposure |
-| No multi tenancy | One deployment serves one customer | Task 4 above |
+| Rate limiting is per process | Replicas each permit the full rate | Needs a shared limiter before horizontal scaling |
+| Namespace filter is not pushed into the backend | A scoped query over fetches | Correct but not efficient; push down before hundreds of tenants |
+| Graph extraction is deterministic | Finds relation, not relation type | Swap the extractor protocol where a model is available |
 
 ---
 
 ## Change log
+
+### 2026-08-25, expansion
+
+Built out the platform for both audiences in one codebase.
+
+| Capability | What it closes |
+|------------|----------------|
+| Hybrid BM25 plus vector retrieval | Exact identifiers were unfindable by a purely semantic index |
+| Graph retrieval tier | Questions whose answer spans documents that never reference each other |
+| Metrics and Prometheus endpoint | Traces described one request; nothing described the fleet |
+| Token accounting and spend ceilings | A local model has no invoice, so cost was invisible until it was not |
+| Semantic answer cache | Repeated questions re-ran the whole pipeline |
+| Identity, roles and namespaces | No way to serve more than one tenant or restrict who sees what |
+| Rate limiting | An endpoint that runs a model on every call is a denial of wallet |
+| Evaluation harness and CI gate | Quality regressions merged silently, since retrieval failure raises nothing |
+
+Defects found and fixed while building, each now covered:
+
+- Fusion bypassed the relevance cutoff, so fused results reported sources that
+  had not grounded the answer. The cutoff now applies to every mode.
+- Graph scaffolding was scored as content by the extractive provider, exactly as
+  citation headers had been, so labels outranked the sentences they introduced.
+- A sentence reaching the context twice, as a passage and as graph evidence, was
+  answered twice verbatim. Sentences are now deduplicated.
+- Cache hits returned before persistence, silently emptying the audit trail the
+  moment caching was enabled, and left concurrent callers indistinguishable.
+- Rate limiting was applied only to ask and ingest, leaving the observability
+  endpoints unbounded. It now sits in the authentication dependency.
+- The evaluation harness found two questions retrieving the right document and
+  omitting the answering sentence. The extractive window moved from four to six.
+
+Known limits recorded rather than hidden: namespace filtering is applied after
+the search rather than pushed into the backend, rate limiting is per process, and
+graph extraction finds that entities are related but not how.
 
 ### 2026-08-24, fifth pass
 
