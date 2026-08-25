@@ -49,4 +49,4 @@ Costs:
   worked and says so plainly when it did not. It is a development and testing aid,
   not a production answer engine.
 - Contributors must remember that a new hard dependency breaks the guarantee. This is
-  called out in `CLAUDE.md` and enforced by CI running with no services.
+  called out in `AGENTS.md` and enforced by CI running with no services.

@@ -137,14 +137,29 @@ def retrieve_node(state: State, context: AgentContext) -> State:
         state["sources"] = []
         return state
 
-    results = context.rag.retrieve(state["question"])
+    results = context.rag.retrieve(state["question"], namespace=state["namespace"])
     state["results"] = results
-    state["context"] = context.rag.format_context(results)
+    passage_context = context.rag.format_context(results)
+
+    # The graph tier contributes only when it recognises an entity in the
+    # question, so it adds nothing to the prompt for questions it cannot help
+    # with. It is appended rather than merged so a reader can tell which part of
+    # the context came from passages and which from relations between documents.
+    graph_context = context.rag.graph_context(state["question"], namespace=state["namespace"])
+    state["graph_context"] = graph_context
+    state["context"] = (
+        f"{passage_context}\n\nRelationships across documents:\n{graph_context}"
+        if graph_context and passage_context
+        else (passage_context or graph_context)
+    )
     state["sources"] = list(dict.fromkeys(result.source for result in results))
     state["steps"].append(
         AgentStep(
             name="retrieve",
-            detail=f"{len(results)} chunk(s) from {len(state['sources'])} source(s)",
+            detail=(
+                f"{len(results)} chunk(s) from {len(state['sources'])} source(s)"
+                + (", plus graph relations" if graph_context else "")
+            ),
             data={
                 "sources": state["sources"],
                 "top_score": round(results[0].score, 4) if results else None,
@@ -218,15 +233,24 @@ def generate_node(state: State, context: AgentContext) -> State:
     return state
 
 
-def initial_state(question: str) -> State:
-    """Build the starting state for a run."""
+def initial_state(question: str, namespace: str = "default") -> State:
+    """Build the starting state for a run.
+
+    The namespace travels in the state rather than on the shared context.
+    A field on the context is process wide, and the API serves each request
+    on a worker thread: one request setting the namespace while another was
+    between setting it and reading it made the second retrieve inside the
+    first one's tenant. Per request data belongs in per request state.
+    """
     return {
         "question": question,
+        "namespace": namespace,
         "needs_knowledge": True,
         "is_pure_math": False,
         "expression": "",
         "wants_tool": False,
         "context": "",
+        "graph_context": "",
         "results": [],
         "sources": [],
         "tool_output": "",

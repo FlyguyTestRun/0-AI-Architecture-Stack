@@ -6,6 +6,7 @@ import pytest
 
 from zerostack.rag.chunking import chunk_text
 from zerostack.rag.embeddings import HashingEmbeddings
+from zerostack.rag.pipeline import RAGPipeline
 from zerostack.rag.store import MemoryVectorStore
 
 
@@ -324,3 +325,230 @@ class TestChromaBackend:
         assert chroma.count() == 0
         chroma.upsert(chunks, vectors)
         assert chroma.count() == 1
+
+
+class TestSourceUniqueness:
+    """Two files sharing a basename must not overwrite each other.
+
+    Chunk ids derive from the source, so using the bare filename meant
+    hr/policy.md and legal/policy.md collided and the second silently replaced
+    the first. A company document tree almost always has repeated filenames, so
+    this lost documents in the most ordinary case there is.
+    """
+
+    @pytest.fixture
+    def nested_corpus(self, tmp_path):
+        for team, text in (
+            ("hr", "HR policy: staff receive twenty vacation days per year."),
+            ("legal", "Legal policy: contracts require two signatures over fifty thousand."),
+            ("finance", "Finance policy: expenses over five hundred need director approval."),
+        ):
+            (tmp_path / team).mkdir()
+            (tmp_path / team / "policy.md").write_text(text, encoding="utf-8")
+        return tmp_path
+
+    def test_all_documents_survive_ingestion(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        report = rag.ingest_path(nested_corpus)
+        assert report.files == 3
+        assert rag.store.count() == 3
+
+    def test_sources_are_paths_relative_to_the_root(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus)
+        sources = {result.source for result in rag.retrieve("policy", top_k=10)}
+        assert sources == {"hr/policy.md", "legal/policy.md", "finance/policy.md"}
+
+    def test_each_document_is_independently_retrievable(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus)
+        assert "vacation" in rag.retrieve("vacation days", top_k=1)[0].text
+        assert "signatures" in rag.retrieve("contracts signatures", top_k=1)[0].text
+
+    def test_a_single_file_keeps_its_basename(self, rag, nested_corpus):
+        rag.store.reset()
+        rag.store.ensure_collection(rag.embeddings.dimensions)
+        rag.ingest_path(nested_corpus / "hr" / "policy.md")
+        assert rag.retrieve("vacation", top_k=1)[0].source == "policy.md"
+
+
+class TestSourceIdentityStability:
+    """The same file must keep one identity however the caller reached it.
+
+    Deriving identity from the path relative to the ingest argument was not
+    enough. Ingesting two sibling directories separately still collided, and
+    ingesting a parent then a child produced two ids for one file and left a
+    stale duplicate in the index.
+    """
+
+    @pytest.fixture
+    def tree(self, tmp_path):
+        for team, text in (
+            ("hr", "HR policy: staff receive twenty vacation days per year."),
+            ("legal", "Legal policy: contracts require two signatures."),
+        ):
+            (tmp_path / team).mkdir()
+            (tmp_path / team / "policy.md").write_text(text, encoding="utf-8")
+        return tmp_path
+
+    def _pipeline(self, settings, tree):
+        settings.rag.corpus_dir = tree
+        return RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+
+    def test_sibling_directories_ingested_separately_do_not_collide(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree / "hr")
+        pipeline.ingest_path(tree / "legal")
+        assert pipeline.store.count() == 2
+
+    def test_reingesting_a_subdirectory_leaves_no_stale_duplicate(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree)
+        assert pipeline.store.count() == 2
+        pipeline.ingest_path(tree / "hr")
+        assert pipeline.store.count() == 2
+
+    def test_display_source_is_stable_across_entry_points(self, settings, tree):
+        pipeline = self._pipeline(settings, tree)
+        pipeline.ingest_path(tree / "hr")
+        via_subdir = {r.source for r in pipeline.retrieve("vacation", top_k=5)}
+
+        other = self._pipeline(settings, tree)
+        other.ingest_path(tree)
+        via_root = {r.source for r in other.retrieve("vacation", top_k=5)}
+
+        assert "hr/policy.md" in via_subdir
+        assert "hr/policy.md" in via_root
+
+    def test_chunk_identity_falls_back_to_source_when_absent(self):
+        chunks = chunk_text("some text about refunds", source="a.md")
+        assert chunks[0].chunk_id == "a.md::0"
+
+    def test_chunk_identity_uses_source_id_when_present(self):
+        chunks = chunk_text("some text about refunds", source="a.md", source_id="/abs/a.md")
+        assert chunks[0].chunk_id == "/abs/a.md::0"
+
+
+class TestHybridRetrieval:
+    """Vector and keyword retrieval fail in different places, so both run."""
+
+    @pytest.fixture
+    def hybrid(self, settings):
+        settings.rag.retrieval_mode = "auto"
+        pipeline = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        pipeline.ingest_text(
+            "Support agents may issue a refund up to two hundred dollars without approval.",
+            source="support.md",
+        )
+        pipeline.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected the transaction.",
+            source="errors.md",
+        )
+        return pipeline
+
+    def test_keyword_index_is_populated_on_ingest(self, hybrid):
+        assert hybrid.keyword.size == 2
+
+    def test_an_exact_identifier_is_retrievable(self, hybrid):
+        results = hybrid.retrieve("E-4471", top_k=3)
+        assert results and results[0].source == "errors.md"
+
+    def test_a_semantic_question_still_works(self, hybrid):
+        results = hybrid.retrieve("refund without approval", top_k=3)
+        assert results and results[0].source == "support.md"
+
+    def test_the_relevance_cutoff_applies_to_fused_results(self, hybrid):
+        """Sources must reflect what grounded the answer in every mode."""
+        results = hybrid.retrieve("E-4471", top_k=4)
+        assert {result.source for result in results} == {"errors.md"}
+
+    def test_vector_only_mode_ignores_the_keyword_tier(self, hybrid):
+        hybrid.settings.retrieval_mode = "vector"
+        assert hybrid.retrieve("refund", top_k=2) is not None
+
+    def test_keyword_only_mode_returns_keyword_hits(self, hybrid):
+        hybrid.settings.retrieval_mode = "keyword"
+        results = hybrid.retrieve("E-4471", top_k=2)
+        assert results and results[0].source == "errors.md"
+
+    def test_describe_reports_the_keyword_tier(self, hybrid):
+        described = hybrid.describe()
+        assert described["keyword_index_size"] == 2
+        assert described["retrieval_mode"] == "auto"
+
+    def test_the_keyword_index_is_rebuilt_from_the_store(self, settings, tmp_path):
+        """A restart must not silently drop the keyword half of hybrid search."""
+        from zerostack.rag.store import QdrantVectorStore
+
+        settings.rag.retrieval_mode = "auto"
+        path = str(tmp_path / "q")
+
+        first = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        first.ingest_text(
+            "Error code E-4471 indicates the payment gateway rejected it.", source="errors.md"
+        )
+        assert first.keyword.size == 1
+        del first
+
+        second = RAGPipeline(
+            store=QdrantVectorStore(url=path, collection="zerostack"),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        assert second.keyword.size == 1, "keyword tier was lost across the restart"
+        assert second.retrieve("E-4471", top_k=2)[0].source == "errors.md"
+
+
+class TestGraphTier:
+    @pytest.fixture
+    def pipeline(self, settings):
+        settings.rag.graph_enabled = True
+        built = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        built.ingest_text("The Refund Policy is owned by the Support Lead.", source="refunds.md")
+        built.ingest_text(
+            "The Escalation Policy is owned by the Engineering Director. "
+            "The Escalation Policy governs Severity 1 handling.",
+            source="escalation.md",
+        )
+        built.ingest_text("The Support Lead may raise a ticket to Severity 1.", source="oncall.md")
+        return built
+
+    def test_the_graph_is_built_during_ingestion(self, pipeline):
+        assert pipeline.graph.relation_count > 0
+
+    def test_graph_context_connects_across_documents(self, pipeline):
+        rendered = pipeline.graph_context(
+            "What links the Support Lead to the Engineering Director?"
+        )
+        assert "escalation.md" in rendered or "oncall.md" in rendered
+
+    def test_an_unknown_entity_costs_nothing(self, pipeline):
+        assert pipeline.graph_context("quantum chromodynamics") == ""
+
+    def test_the_tier_can_be_disabled(self, pipeline):
+        pipeline.settings.graph_enabled = False
+        assert pipeline.graph_context("Support Lead") == ""
+
+    def test_describe_reports_the_graph(self, pipeline):
+        described = pipeline.describe()["graph"]
+        assert described["entities"] > 0
+        assert described["extractor"] == "pattern"

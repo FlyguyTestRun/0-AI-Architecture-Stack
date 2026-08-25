@@ -153,8 +153,8 @@ explicit rather than a pair of matching string literals.
 One `ToolRegistry` holds built in tools and MCP discovered tools in the same shape.
 The orchestrator resolves by name and cannot tell them apart.
 
-Servers are declared in `mcp.json`, using the format Claude Code and Claude Desktop
-already use. Discovery failures are contained per server.
+Servers are declared in `mcp.json`, using the conventional MCP client configuration
+shape that most MCP capable clients already read. Discovery failures are contained per server.
 
 Tool selection is rule based rather than model driven, which keeps the path
 deterministic, testable, and functional with any provider including the offline one.
@@ -166,9 +166,18 @@ treated as hostile. See [ADR ZS-004](docs/adr/ZS-004-mcp-for-tools.md).
 
 ## Layer 6: Code agent
 
-Not runtime code. The conventions that let Claude Code or Aider work on this
-repository productively: `CLAUDE.md` for operating rules, `modes/` for how much to ask
+Not runtime code. The conventions that let a code agent work on this repository
+productively: `AGENTS.md` for operating rules, `modes/` for how much to ask
 in each phase, `docs/adr/` for decisions that should not be relitigated.
+
+### Ingest boundary
+
+`ingest` accepts a filesystem path, which makes it a trust boundary. Untrusted
+callers are restricted to `allowed_ingest_roots`, defaulting to the corpus directory.
+Paths are resolved before comparison, so traversal segments and symlinks cannot walk
+out of the allowlist, and the boundary is evaluated before existence so a refused
+path does not reveal whether it exists. The CLI opts out explicitly, because an
+operator with shell access can already read those files.
 
 ## Layer 7: Data
 

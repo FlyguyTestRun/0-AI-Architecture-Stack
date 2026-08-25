@@ -13,16 +13,33 @@ from typing import Any
 
 @dataclass
 class Chunk:
-    """A retrievable unit of text plus its provenance."""
+    """A retrievable unit of text plus its provenance.
+
+    ``source`` is for display and appears in citations. ``source_id`` is the
+    stable identity used to build the chunk id, and defaults to ``source``.
+
+    The two are separate because they answer different questions. Display wants a
+    short readable name; identity has to be the same string every time the same
+    file is ingested, however the caller reached it. Deriving identity from the
+    display name meant ingesting ``hr`` and ``legal`` separately gave both files
+    the id ``policy.md::0`` so one overwrote the other, while ingesting the
+    parent and then a subdirectory produced two ids for one file and left a stale
+    duplicate behind.
+    """
 
     text: str
     source: str
     index: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    source_id: str = ""
+    # The tenancy boundary. Carried on the chunk rather than inferred at query
+    # time so that a chunk can never be served outside the namespace it was
+    # ingested into, whichever retrieval path reaches it.
+    namespace: str = "default"
 
     @property
     def chunk_id(self) -> str:
-        return f"{self.source}::{self.index}"
+        return f"{self.source_id or self.source}::{self.index}"
 
 
 def chunk_text(
@@ -31,6 +48,8 @@ def chunk_text(
     chunk_size: int = 800,
     chunk_overlap: int = 120,
     metadata: dict[str, Any] | None = None,
+    source_id: str = "",
+    namespace: str = "default",
 ) -> list[Chunk]:
     """Split ``text`` into overlapping chunks of roughly ``chunk_size`` characters."""
     if chunk_size <= 0:
@@ -60,6 +79,8 @@ def chunk_text(
                     source=source,
                     index=len(chunks),
                     metadata=dict(metadata or {}),
+                    source_id=source_id,
+                    namespace=namespace,
                 )
             )
         buffer = ""
@@ -78,6 +99,8 @@ def chunk_text(
                             source=source,
                             index=len(chunks),
                             metadata=dict(metadata or {}),
+                            source_id=source_id,
+                            namespace=namespace,
                         )
                     )
             continue

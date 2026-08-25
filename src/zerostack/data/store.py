@@ -38,11 +38,13 @@ CREATE TABLE IF NOT EXISTS runs (
     latency_ms REAL NOT NULL,
     sources TEXT NOT NULL DEFAULT '[]',
     steps TEXT NOT NULL DEFAULT '[]',
+    namespace TEXT NOT NULL DEFAULT 'default',
     created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_trace_id ON runs (trace_id);
+CREATE INDEX IF NOT EXISTS idx_runs_namespace ON runs (namespace);
 """
 
 
@@ -57,6 +59,10 @@ class RunRecord:
     llm_model: str
     latency_ms: float
     trace_id: str = ""
+    # The tenant this run belongs to. Stored so the operational endpoints can be
+    # scoped: without it the run log hands every tenant's questions and answers,
+    # including retrieved document text, to any operator who can read it.
+    namespace: str = "default"
     sources: list[str] = field(default_factory=list)
     steps: list[dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -74,6 +80,7 @@ class RunRecord:
             self.latency_ms,
             json.dumps(self.sources),
             json.dumps(self.steps),
+            self.namespace,
             self.created_at,
         )
 
@@ -108,6 +115,20 @@ class StateStore:
 
     def _migrate(self) -> None:
         with self.connect() as connection:
+            # The column is added before the schema script runs, not after.
+            # CREATE TABLE IF NOT EXISTS will not add a column to a table that
+            # already exists, so on a database written before the tenancy work
+            # the table stays as it was, and the script's index on the new column
+            # would then be created against a column that does not exist yet.
+            # An empty result means there is no runs table at all, which is a
+            # fresh database: the script below creates it complete.
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if columns and "namespace" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'"
+                )
             connection.executescript(SCHEMA)
 
     def save_run(self, record: RunRecord) -> str:
@@ -116,18 +137,36 @@ class StateStore:
                 """
                 INSERT INTO runs (
                     id, trace_id, question, answer, orchestrator, llm_provider,
-                    llm_model, latency_ms, sources, steps, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    llm_model, latency_ms, sources, steps, namespace, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 record.to_row(),
             )
         return record.id
 
-    def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def recent_runs(
+        self, limit: int = 20, namespaces: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return recent runs, restricted to ``namespaces`` when given.
+
+        ``None`` means no restriction and is for a caller that already holds
+        wildcard access. An empty list restricts to nothing rather than to
+        everything, so a caller with no namespaces cannot read the whole log.
+        """
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if namespaces is None:
+                rows = connection.execute(
+                    "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+                ).fetchall()
+            elif not namespaces:
+                return []
+            else:
+                placeholders = ",".join("?" for _ in namespaces)
+                rows = connection.execute(
+                    "SELECT * FROM runs WHERE namespace IN "
+                    f"({placeholders}) ORDER BY created_at DESC LIMIT ?",
+                    (*namespaces, limit),
+                ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -147,16 +186,29 @@ class StateStore:
         return record
 
 
-def analytics_summary(sqlite_path: Path | None = None) -> dict[str, Any]:
+def analytics_summary(
+    sqlite_path: Path | None = None, namespaces: list[str] | None = None
+) -> dict[str, Any]:
     """Aggregate run metrics with DuckDB.
 
     DuckDB reads the SQLite file directly through its sqlite scanner, so analytics
     never blocks the application's writes. If DuckDB or the scanner extension is not
     available the same aggregate is computed in SQLite instead.
+
+    ``namespaces`` restricts the aggregate to a caller's tenants. ``None`` means
+    unrestricted, for a caller holding wildcard access; an empty list restricts
+    to nothing, so a caller with no namespaces does not see the whole estate.
     """
     path = sqlite_path or get_settings().data.sqlite_path
     if not Path(path).exists():
         return {"runs": 0, "engine": "none"}
+    if namespaces is not None and not namespaces:
+        return {"runs": 0, "engine": "none", "by_backend": []}
+
+    # Values are bound as parameters in both engines below; only the placeholder
+    # count is built from the list length.
+    scope = "" if namespaces is None else f"WHERE namespace IN ({','.join('?' * len(namespaces))})"
+    params: tuple = () if namespaces is None else tuple(namespaces)
 
     try:
         import duckdb
@@ -170,18 +222,20 @@ def analytics_summary(sqlite_path: Path | None = None) -> dict[str, Any]:
         escaped = str(path).replace("'", "''")
         connection.execute(f"ATTACH '{escaped}' AS app (TYPE sqlite);")
         rows = connection.execute(
-            """
+            f"""
             SELECT orchestrator,
                    llm_provider,
                    COUNT(*) AS runs,
                    ROUND(AVG(latency_ms), 2) AS avg_latency_ms,
                    ROUND(MAX(latency_ms), 2) AS max_latency_ms
             FROM app.runs
+            {scope}
             GROUP BY orchestrator, llm_provider
             ORDER BY runs DESC
-            """
+            """,
+            params,
         ).fetchall()
-        total = connection.execute("SELECT COUNT(*) FROM app.runs").fetchone()[0]
+        total = connection.execute(f"SELECT COUNT(*) FROM app.runs {scope}", params).fetchone()[0]
         connection.close()
         return {
             "engine": "duckdb",
@@ -203,15 +257,17 @@ def analytics_summary(sqlite_path: Path | None = None) -> dict[str, Any]:
     store = StateStore(path)
     with store.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT orchestrator, llm_provider, COUNT(*),
                    ROUND(AVG(latency_ms), 2), ROUND(MAX(latency_ms), 2)
-            FROM runs GROUP BY orchestrator, llm_provider ORDER BY 3 DESC
-            """
+            FROM runs {scope} GROUP BY orchestrator, llm_provider ORDER BY 3 DESC
+            """,
+            params,
         ).fetchall()
+        total = connection.execute(f"SELECT COUNT(*) FROM runs {scope}", params).fetchone()[0]
     return {
         "engine": "sqlite",
-        "runs": store.count_runs(),
+        "runs": int(total),
         "by_backend": [
             {
                 "orchestrator": row[0],

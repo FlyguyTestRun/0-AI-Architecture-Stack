@@ -9,7 +9,7 @@ BIN    := $(VENV)/bin
 MODEL  ?= gemma3:4b
 
 .DEFAULT_GOAL := help
-.PHONY: help setup demo doctor ingest serve ui test lint fmt up down logs pull-model clean check
+.PHONY: help setup demo doctor ingest serve ui test lint fmt up down logs pull-model clean check evals
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -51,7 +51,10 @@ fmt: setup ## Apply formatting and autofixable lint rules
 	$(BIN)/ruff format src tests apps
 	$(BIN)/ruff check --fix src tests apps
 
-check: lint test ## Everything CI runs
+evals: setup ## Measure retrieval and answer quality against the golden set
+	$(BIN)/zerostack evaluate --min-pass-rate 1.0 --min-recall 1.0
+
+check: lint test evals ## Everything CI runs
 
 up: ## Start Qdrant, Ollama and Phoenix
 	docker compose up -d

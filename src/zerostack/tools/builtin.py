@@ -49,13 +49,34 @@ def _eval_node(node: ast.AST) -> float:
     raise ValueError(f"unsupported expression: {type(node).__name__}")
 
 
+# Long enough for any expression a person types, short enough that parsing it
+# cannot exhaust the stack. Expression text can originate in a retrieved
+# document, so its length is not something to trust.
+MAX_EXPRESSION_LENGTH = 500
+
+
 def calculate(expression: str) -> ToolResult:
-    """Evaluate a arithmetic expression safely."""
+    """Evaluate an arithmetic expression safely."""
+    if len(expression) > MAX_EXPRESSION_LENGTH:
+        return ToolResult(
+            ok=False,
+            content="",
+            error=f"expression exceeds {MAX_EXPRESSION_LENGTH} characters",
+        )
     try:
         tree = ast.parse(expression, mode="eval")
         value = _eval_node(tree.body)
-    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError) as exc:
-        return ToolResult(ok=False, content="", error=str(exc))
+    except (
+        SyntaxError,
+        ValueError,
+        ZeroDivisionError,
+        OverflowError,
+        # Deeply nested input exhausts the stack during parsing or evaluation.
+        # It is a bad input, not a crash, so it is reported like any other.
+        RecursionError,
+        MemoryError,
+    ) as exc:
+        return ToolResult(ok=False, content="", error=str(exc) or type(exc).__name__)
     return ToolResult(ok=True, content=str(value), data={"result": value})
 
 
