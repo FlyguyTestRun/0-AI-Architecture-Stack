@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from zerostack.config import Settings, get_settings
+from zerostack.config import SecuritySettings, Settings, get_settings
 from zerostack.data import RunRecord, StateStore, analytics_summary
 from zerostack.llm import build_llm
 from zerostack.llm.ollama import OllamaLLM
@@ -31,6 +31,7 @@ from zerostack.orchestrator import (
 )
 from zerostack.orchestrator.factory import available_engines
 from zerostack.rag import RAGPipeline
+from zerostack.security import PrincipalStore, RateLimiter
 from zerostack.tools import build_registry
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,11 @@ class ZerostackApp:
             daily_token_budget=self.settings.cost.daily_token_budget,
             daily_cost_budget_usd=self.settings.cost.daily_cost_budget_usd,
         )
+        self.principals = _build_principals(self.settings.security)
+        self.rate_limiter = RateLimiter(
+            requests_per_minute=self.settings.security.requests_per_minute,
+            burst=self.settings.security.rate_limit_burst,
+        )
         self.cache = SemanticCache(
             threshold=self.settings.cache.threshold,
             max_entries=self.settings.cache.max_entries,
@@ -67,15 +73,22 @@ class ZerostackApp:
         )
         self.orchestrator = build_orchestrator(self.context, self.settings.orchestrator)
 
-    def ask(self, question: str, persist: bool = True, use_cache: bool = True) -> AgentResult:
+    def ask(
+        self,
+        question: str,
+        persist: bool = True,
+        use_cache: bool = True,
+        namespace: str | None = None,
+    ) -> AgentResult:
         """Run one question through the agent and record the result."""
         if not question or not question.strip():
             raise ValueError("question must not be empty")
         question = question.strip()
 
-        self.metrics.increment("zerostack_requests_total")
+        namespace = namespace or self.settings.security.default_namespace
+        self.metrics.increment("zerostack_requests_total", labels={"namespace": namespace})
 
-        cached = self._cache_lookup(question) if use_cache else None
+        cached = self._cache_lookup(question, namespace) if use_cache else None
         if cached is not None:
             # A cache hit is still a question somebody asked. Returning early
             # without recording it would leave the run log, and therefore the
@@ -83,6 +96,8 @@ class ZerostackApp:
             if persist:
                 self._persist(cached)
             return cached
+
+        self.context.namespace = namespace
 
         if self.settings.cost.enabled:
             # Checked before the call so the ceiling is a limit rather than a
@@ -97,7 +112,7 @@ class ZerostackApp:
             raise
 
         self._account(question, result)
-        self._cache_store(question, result)
+        self._cache_store(question, result, namespace)
 
         if persist:
             self._persist(result)
@@ -157,7 +172,7 @@ class ZerostackApp:
                 "to widen them."
             )
 
-    def _cache_lookup(self, question: str) -> AgentResult | None:
+    def _cache_lookup(self, question: str, namespace: str = "default") -> AgentResult | None:
         """Serve a close enough previous answer, if one exists."""
         if not self.settings.cache.enabled:
             return None
@@ -170,7 +185,7 @@ class ZerostackApp:
         # A fresh trace id per request, so two callers served the same cached
         # answer are still distinguishable in the trace and the run log.
         trace_id = get_tracer().new_trace()
-        lookup = self.cache.lookup(embedding)
+        lookup = self.cache.lookup(embedding, namespace=namespace)
         self.metrics.increment(
             "zerostack_cache_events_total",
             labels={"outcome": "hit" if lookup.hit else "miss"},
@@ -197,7 +212,7 @@ class ZerostackApp:
             trace_id=trace_id,
         )
 
-    def _cache_store(self, question: str, result: AgentResult) -> None:
+    def _cache_store(self, question: str, result: AgentResult, namespace: str = "default") -> None:
         if not self.settings.cache.enabled or not result.answer:
             return
         try:
@@ -206,6 +221,7 @@ class ZerostackApp:
                 answer=result.answer,
                 embedding=self.rag.embeddings.embed_one(question),
                 sources=result.sources,
+                namespace=namespace,
             )
         except Exception as exc:
             logger.debug("cache store skipped: %s", exc)
@@ -228,7 +244,12 @@ class ZerostackApp:
             self.metrics.increment("zerostack_llm_cost_usd_total", usage.cost_usd)
         self.metrics.observe("zerostack_llm_seconds", result.latency_ms / 1000.0)
 
-    def ingest(self, path: Path | str | None = None, enforce_roots: bool = True) -> dict[str, Any]:
+    def ingest(
+        self,
+        path: Path | str | None = None,
+        enforce_roots: bool = True,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
         """Ingest a file or directory into the vector store.
 
         ``enforce_roots`` defaults to True so that every caller is restricted
@@ -239,7 +260,8 @@ class ZerostackApp:
             self._check_ingest_allowed(target)
         if not target.exists():
             raise FileNotFoundError(f"nothing to ingest at {target}")
-        report = self.rag.ingest_path(target)
+        namespace = namespace or self.settings.security.default_namespace
+        report = self.rag.ingest_path(target, namespace=namespace)
 
         # An answer built from a document that has since changed is worse than no
         # cache at all, so ingestion drops exactly the entries it invalidates.
@@ -252,6 +274,7 @@ class ZerostackApp:
 
         return {
             "cache_entries_invalidated": invalidated,
+            "namespace": namespace,
             "path": str(target),
             "files": report.files,
             "chunks": report.chunks,
@@ -286,6 +309,11 @@ class ZerostackApp:
                 "data": {
                     "sqlite_path": str(self.settings.data.sqlite_path),
                     "runs": self.store.count_runs(),
+                },
+                "security": {
+                    **self.principals.describe(),
+                    "rate_limit": self.rate_limiter.snapshot(),
+                    "default_namespace": self.settings.security.default_namespace,
                 },
                 "cost": self.costs.snapshot(),
                 "cache": self.cache.snapshot(),
@@ -335,3 +363,10 @@ def _parse_prices(table: str) -> dict[str, tuple[float, float]]:
         except ValueError:
             logger.warning("ignoring price entry with non numeric values %r", item)
     return prices
+
+
+def _build_principals(settings: SecuritySettings) -> PrincipalStore:
+    """Load principals from a file if given, otherwise from the inline table."""
+    if settings.principals_file:
+        return PrincipalStore.from_file(settings.principals_file)
+    return PrincipalStore.from_json(settings.principals)

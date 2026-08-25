@@ -32,6 +32,7 @@ class SearchResult:
     source: str
     score: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    namespace: str = "default"
 
 
 @runtime_checkable
@@ -110,6 +111,7 @@ class MemoryVectorStore:
                 source=chunk.source,
                 score=_cosine(vector, candidate),
                 metadata=chunk.metadata,
+                namespace=chunk.namespace,
             )
             for chunk, candidate in zip(self._chunks, self._vectors, strict=True)
         ]
@@ -193,6 +195,7 @@ class QdrantVectorStore:
                     "text": chunk.text,
                     "source": chunk.source,
                     "metadata": chunk.metadata,
+                    "namespace": chunk.namespace,
                 },
             )
             for chunk, vector in zip(chunks, vectors, strict=True)
@@ -220,6 +223,7 @@ class QdrantVectorStore:
                     source=payload.get("source", "unknown"),
                     score=float(hit.score),
                     metadata=payload.get("metadata", {}) or {},
+                    namespace=payload.get("namespace", "default"),
                 )
             )
         return results
@@ -251,6 +255,7 @@ class QdrantVectorStore:
                     index=int(index) if index.isdigit() else 0,
                     metadata=payload.get("metadata", {}) or {},
                     source_id=source_id,
+                    namespace=payload.get("namespace", "default"),
                 )
             if offset is None:
                 break
@@ -289,7 +294,10 @@ class ChromaVectorStore:
             ids=[chunk.chunk_id for chunk in chunks],
             embeddings=vectors,
             documents=[chunk.text for chunk in chunks],
-            metadatas=[{"source": chunk.source, **chunk.metadata} for chunk in chunks],
+            metadatas=[
+                {"source": chunk.source, "namespace": chunk.namespace, **chunk.metadata}
+                for chunk in chunks
+            ],
         )
         return len(chunks)
 
@@ -316,6 +324,7 @@ class ChromaVectorStore:
                     text=document,
                     source=metadata.pop("source", "unknown"),
                     score=score,
+                    namespace=metadata.pop("namespace", "default"),
                     metadata=metadata,
                 )
             )
@@ -336,6 +345,7 @@ class ChromaVectorStore:
                 text=document or "",
                 source=metadata.pop("source", "unknown"),
                 index=int(index) if index.isdigit() else 0,
+                namespace=metadata.pop("namespace", "default"),
                 metadata=metadata,
                 source_id=source_id,
             )

@@ -173,6 +173,28 @@ class CacheSettings(BaseSettings):
     ttl_seconds: float = 3600.0
 
 
+class SecuritySettings(BaseSettings):
+    """Identity, tenancy and rate limiting. Every control here is opt in."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_SECURITY_",
+        env_file=_DOTENV,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # A JSON mapping of API key to principal. Empty means authentication is off
+    # and every caller is a local administrator, which is right for one machine
+    # and wrong for anything exposed. `zerostack doctor` states which is active.
+    principals: str = ""
+    principals_file: Path | None = None
+    default_namespace: str = "default"
+    # Zero disables the limiter. An endpoint that runs a model on every call is a
+    # denial of wallet as much as a denial of service.
+    requests_per_minute: int = 0
+    rate_limit_burst: int = 0
+
+
 class Settings(BaseSettings):
     """Top level settings object composed of one section per layer."""
 
@@ -188,6 +210,7 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     cost: CostSettings = Field(default_factory=CostSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
 
     def ensure_directories(self) -> None:
         """Create the directories the local backends write into."""

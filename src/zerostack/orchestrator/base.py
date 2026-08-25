@@ -63,6 +63,9 @@ class AgentContext:
     rag: RAGPipeline
     tools: ToolRegistry
     settings: OrchestratorSettings = field(default_factory=lambda: get_settings().orchestrator)
+    # Set per request by the application. Nodes read it so retrieval and graph
+    # traversal stay inside the caller's tenancy boundary.
+    namespace: str = "default"
 
 
 @runtime_checkable

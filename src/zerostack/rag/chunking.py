@@ -32,6 +32,10 @@ class Chunk:
     index: int
     metadata: dict[str, Any] = field(default_factory=dict)
     source_id: str = ""
+    # The tenancy boundary. Carried on the chunk rather than inferred at query
+    # time so that a chunk can never be served outside the namespace it was
+    # ingested into, whichever retrieval path reaches it.
+    namespace: str = "default"
 
     @property
     def chunk_id(self) -> str:
@@ -45,6 +49,7 @@ def chunk_text(
     chunk_overlap: int = 120,
     metadata: dict[str, Any] | None = None,
     source_id: str = "",
+    namespace: str = "default",
 ) -> list[Chunk]:
     """Split ``text`` into overlapping chunks of roughly ``chunk_size`` characters."""
     if chunk_size <= 0:
@@ -75,6 +80,7 @@ def chunk_text(
                     index=len(chunks),
                     metadata=dict(metadata or {}),
                     source_id=source_id,
+                    namespace=namespace,
                 )
             )
         buffer = ""
@@ -94,6 +100,7 @@ def chunk_text(
                             index=len(chunks),
                             metadata=dict(metadata or {}),
                             source_id=source_id,
+                            namespace=namespace,
                         )
                     )
             continue

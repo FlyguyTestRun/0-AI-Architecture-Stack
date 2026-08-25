@@ -137,7 +137,7 @@ def retrieve_node(state: State, context: AgentContext) -> State:
         state["sources"] = []
         return state
 
-    results = context.rag.retrieve(state["question"])
+    results = context.rag.retrieve(state["question"], namespace=context.namespace)
     state["results"] = results
     passage_context = context.rag.format_context(results)
 
@@ -145,7 +145,7 @@ def retrieve_node(state: State, context: AgentContext) -> State:
     # question, so it adds nothing to the prompt for questions it cannot help
     # with. It is appended rather than merged so a reader can tell which part of
     # the context came from passages and which from relations between documents.
-    graph_context = context.rag.graph_context(state["question"])
+    graph_context = context.rag.graph_context(state["question"], namespace=context.namespace)
     state["graph_context"] = graph_context
     state["context"] = (
         f"{passage_context}\n\nRelationships across documents:\n{graph_context}"

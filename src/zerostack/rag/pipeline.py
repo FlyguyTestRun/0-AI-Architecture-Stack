@@ -104,14 +104,22 @@ class RAGPipeline:
         self.store = store or build_vector_store(self.settings)
         self.store.ensure_collection(self.embeddings.dimensions)
         self.keyword = BM25Index()
-        self.graph = KnowledgeGraph()
+        self._graphs: dict[str, KnowledgeGraph] = {}
+        self.graph = self._graph_for("default")
         self._keyword_chunks: dict[str, Chunk] = {}
         # The vector store may already hold documents from a previous process
         # while the keyword index starts empty every time, so it is rebuilt from
         # the store rather than left silently behind.
         self._sync_keyword_index()
 
-    def ingest_text(self, text: str, source: str, source_id: str = "", **metadata: object) -> int:
+    def ingest_text(
+        self,
+        text: str,
+        source: str,
+        source_id: str = "",
+        namespace: str = "default",
+        **metadata: object,
+    ) -> int:
         """Chunk, embed and upsert a single document. Returns the chunk count."""
         chunks = chunk_text(
             text,
@@ -120,6 +128,7 @@ class RAGPipeline:
             chunk_overlap=self.settings.chunk_overlap,
             metadata=dict(metadata),
             source_id=source_id,
+            namespace=namespace,
         )
         return self._upsert(chunks)
 
@@ -138,7 +147,7 @@ class RAGPipeline:
                 continue
         return file_path.name
 
-    def ingest_path(self, path: Path) -> IngestReport:
+    def ingest_path(self, path: Path, namespace: str = "default") -> IngestReport:
         """Ingest a file, or every supported text file under a directory."""
         report = IngestReport()
         paths = (
@@ -167,7 +176,10 @@ class RAGPipeline:
                 count = self.ingest_text(
                     content,
                     source=self._display_source(file_path, path),
-                    source_id=file_path.resolve().as_posix(),
+                    # Namespaced so the same file ingested into two namespaces
+                    # produces two independent chunks rather than one shared one.
+                    source_id=f"{namespace}::{file_path.resolve().as_posix()}",
+                    namespace=namespace,
                 )
                 if count:
                     report.files += 1
@@ -186,7 +198,8 @@ class RAGPipeline:
         if not chunks:
             return
         self.keyword.clear()
-        self.graph.clear()
+        self._graphs.clear()
+        self.graph = self._graph_for("default")
         self._keyword_chunks.clear()
         self._index_keywords(chunks)
         logger.info("rag layer: keyword and graph tiers rebuilt from %d chunk(s)", len(chunks))
@@ -196,7 +209,17 @@ class RAGPipeline:
             self.keyword.add(chunk.chunk_id, chunk.text)
             self._keyword_chunks[chunk.chunk_id] = chunk
             if self.settings.graph_enabled:
-                self.graph.add_document(chunk.text, chunk.source)
+                # One graph per namespace. A shared graph would let a traversal
+                # walk from one tenant's entity into another tenant's document,
+                # which is exactly the boundary the namespace exists to draw.
+                self._graph_for(chunk.namespace).add_document(chunk.text, chunk.source)
+
+    def _graph_for(self, namespace: str) -> KnowledgeGraph:
+        graph = self._graphs.get(namespace)
+        if graph is None:
+            graph = KnowledgeGraph()
+            self._graphs[namespace] = graph
+        return graph
 
     def _upsert(self, chunks: list[Chunk]) -> int:
         if not chunks:
@@ -210,11 +233,15 @@ class RAGPipeline:
         vector = self.embeddings.embed_one(query)
         return self.store.search(vector, top_k=limit, score_threshold=self.settings.score_threshold)
 
-    def _keyword_search(self, query: str, limit: int) -> list[SearchResult]:
+    def _keyword_search(
+        self, query: str, limit: int, namespace: str | None = None
+    ) -> list[SearchResult]:
         results: list[SearchResult] = []
         for hit in self.keyword.search(query, top_k=limit):
             chunk = self._keyword_chunks.get(hit.chunk_id)
             if chunk is None:
+                continue
+            if namespace is not None and chunk.namespace != namespace:
                 continue
             results.append(
                 SearchResult(
@@ -223,6 +250,7 @@ class RAGPipeline:
                     source=chunk.source,
                     score=hit.score,
                     metadata=chunk.metadata,
+                    namespace=chunk.namespace,
                 )
             )
         return results
@@ -256,21 +284,32 @@ class RAGPipeline:
                     source=result.source,
                     score=score,
                     metadata=result.metadata,
+                    namespace=result.namespace,
                 )
             )
         return merged
 
-    def retrieve(self, query: str, top_k: int | None = None) -> list[SearchResult]:
-        """Return the chunks most relevant to ``query``."""
+    def retrieve(
+        self, query: str, top_k: int | None = None, namespace: str | None = None
+    ) -> list[SearchResult]:
+        """Return the chunks most relevant to ``query``, within a namespace."""
         top_k = top_k or self.settings.top_k
         mode = self.settings.retrieval_mode
-        with get_tracer().span("rag.retrieve", query=query, top_k=top_k, mode=mode) as span:
+        with get_tracer().span(
+            "rag.retrieve", query=query, top_k=top_k, mode=mode, namespace=namespace
+        ) as span:
             candidates = max(top_k, self.settings.fusion_candidates)
+            # Over fetch when scoping, because the namespace filter is applied
+            # after the search and would otherwise return fewer than top_k.
+            if namespace is not None:
+                candidates *= 4
             use_keyword = mode in ("auto", "hybrid", "keyword") and self.keyword.size > 0
             use_vector = mode in ("auto", "hybrid", "vector")
 
             vector_hits = self._vector_search(query, candidates) if use_vector else []
-            keyword_hits = self._keyword_search(query, candidates) if use_keyword else []
+            if namespace is not None:
+                vector_hits = [h for h in vector_hits if h.namespace == namespace]
+            keyword_hits = self._keyword_search(query, candidates, namespace) if use_keyword else []
 
             if use_vector and use_keyword:
                 results = self._fuse(vector_hits, keyword_hits, top_k)
@@ -309,16 +348,17 @@ class RAGPipeline:
             return results
         return [result for result in results if result.score >= best * ratio]
 
-    def graph_context(self, query: str) -> str:
+    def graph_context(self, query: str, namespace: str = "default") -> str:
         """Relations connecting the entities this query names, as prompt context.
 
         Returns an empty string when the graph knows none of the query's
         entities, so a question the graph cannot help with costs nothing.
         """
-        if not self.settings.graph_enabled or self.graph.relation_count == 0:
+        graph = self._graphs.get(namespace)
+        if not self.settings.graph_enabled or graph is None or graph.relation_count == 0:
             return ""
-        with get_tracer().span("rag.graph_traverse", query=query) as span:
-            neighbourhood = self.graph.traverse(
+        with get_tracer().span("rag.graph_traverse", query=query, namespace=namespace) as span:
+            neighbourhood = graph.traverse(
                 query,
                 hops=self.settings.graph_hops,
                 max_entities=self.settings.graph_max_entities,
@@ -352,4 +392,5 @@ class RAGPipeline:
             "retrieval_mode": self.settings.retrieval_mode,
             "keyword_index_size": self.keyword.size,
             "graph": self.graph.describe(),
+            "namespaces": sorted(self._graphs),
         }
