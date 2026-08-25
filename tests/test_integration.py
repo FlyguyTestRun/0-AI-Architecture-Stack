@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -256,4 +258,113 @@ class TestCacheInvalidationIsTargeted:
         result = app.ingest(str(empty), enforce_roots=False)
 
         assert result["cache_entries_invalidated"] == 0
+        assert app.cache.size == before
+
+
+class TestNamespaceIsolationUnderConcurrency:
+    """The namespace must travel with the request, not on the shared context.
+
+    The API serves each request on a worker thread against one application
+    object. A namespace stored on the shared orchestrator context is process
+    wide: one request setting it while another sat between setting and reading
+    made the second retrieve inside the first one's tenant.
+    """
+
+    @pytest.fixture
+    def tenants(self, settings, tmp_path):
+        corpus = tmp_path / "corpus"
+        (corpus / "hr").mkdir(parents=True)
+        (corpus / "legal").mkdir(parents=True)
+        (corpus / "hr" / "h.md").write_text(
+            "TOKEN_HR marker. The probationary period is ninety days.", encoding="utf-8"
+        )
+        (corpus / "legal" / "l.md").write_text(
+            "TOKEN_LEGAL marker. The retention period is seven years.", encoding="utf-8"
+        )
+        settings.rag.corpus_dir = corpus
+        settings.cache.enabled = False
+        instance = ZerostackApp(settings=settings, include_mcp=False)
+        instance.ingest(str(corpus / "hr"), namespace="hr", enforce_roots=False)
+        instance.ingest(str(corpus / "legal"), namespace="legal", enforce_roots=False)
+        return instance
+
+    def test_retrieval_uses_the_namespace_the_caller_asked_for(self, tenants, monkeypatch):
+        """Instrumented at the read, because the race window is microseconds."""
+        from zerostack.rag.pipeline import RAGPipeline
+
+        wanted = threading.local()
+        mismatches: list[tuple[str, str | None]] = []
+        original = RAGPipeline.retrieve
+
+        def traced(self, query, top_k=None, namespace=None):
+            expected = getattr(wanted, "namespace", None)
+            if expected is not None and namespace != expected:
+                mismatches.append((expected, namespace))
+            time.sleep(0.002)
+            return original(self, query, top_k=top_k, namespace=namespace)
+
+        monkeypatch.setattr(RAGPipeline, "retrieve", traced)
+
+        def hammer(namespace: str) -> None:
+            wanted.namespace = namespace
+            for _ in range(30):
+                tenants.ask(
+                    "What is the period?", namespace=namespace, persist=False, use_cache=False
+                )
+
+        threads = [
+            threading.Thread(target=hammer, args=("hr",)),
+            threading.Thread(target=hammer, args=("legal",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert mismatches == []
+
+    def test_a_single_request_still_reaches_its_own_tenant(self, tenants):
+        result = tenants.ask("What is the period?", namespace="hr", persist=False, use_cache=False)
+        assert "TOKEN_LEGAL" not in result.answer
+
+
+class TestUngroundedAnswersAreInvalidated:
+    """An answer built from finding nothing records no source.
+
+    Source based invalidation can never match it, so without a separate rule it
+    keeps reporting "nothing found" for its whole TTL after the very document
+    that answers it was ingested.
+    """
+
+    @pytest.fixture
+    def empty_corpus_app(self, settings, tmp_path):
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        settings.rag.corpus_dir = corpus
+        settings.cache.enabled = True
+        return ZerostackApp(settings=settings, include_mcp=False), corpus
+
+    def test_the_no_context_answer_is_dropped_when_a_document_arrives(self, empty_corpus_app):
+        app, corpus = empty_corpus_app
+        first = app.ask("How long is the probationary period?", persist=False)
+        assert first.sources == []
+        assert app.cache.size == 1
+
+        (corpus / "hr.md").write_text("The probationary period is ninety days.", encoding="utf-8")
+        app.ingest(str(corpus), enforce_roots=False)
+
+        second = app.ask("How long is the probationary period?", persist=False)
+        assert second.answer != first.answer
+        assert second.sources == ["hr.md"]
+
+    def test_a_grounded_entry_in_another_namespace_survives(self, empty_corpus_app):
+        app, corpus = empty_corpus_app
+        (corpus / "hr.md").write_text("The probationary period is ninety days.", encoding="utf-8")
+        app.ingest(str(corpus), namespace="hr", enforce_roots=False)
+        app.ask("How long is the probationary period?", namespace="hr", persist=False)
+        before = app.cache.size
+
+        (corpus / "other.md").write_text("Lunch is served at noon.", encoding="utf-8")
+        app.ingest(str(corpus / "other.md"), namespace="default", enforce_roots=False)
+
         assert app.cache.size == before

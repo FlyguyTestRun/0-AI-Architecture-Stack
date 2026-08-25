@@ -27,13 +27,13 @@ class SimpleOrchestrator:
     def __init__(self, context: AgentContext) -> None:
         self.context = context
 
-    def run(self, question: str) -> AgentResult:
+    def run(self, question: str, namespace: str = "default") -> AgentResult:
         tracer = get_tracer()
         trace_id = tracer.new_trace()
         start = time.perf_counter()
 
         with tracer.span("orchestrator.run", engine=self.name, question=question):
-            state = initial_state(question)
+            state = initial_state(question, namespace)
             state = plan_node(state, self.context)
             if state["needs_knowledge"]:
                 state = retrieve_node(state, self.context)

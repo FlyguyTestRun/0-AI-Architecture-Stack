@@ -22,7 +22,7 @@ from zerostack.observability import (
     get_metrics,
     get_tracer,
 )
-from zerostack.observability.cost import DEFAULT_PRICES
+from zerostack.observability.cost import DEFAULT_PRICES, estimate_tokens
 from zerostack.orchestrator import (
     AgentContext,
     AgentResult,
@@ -97,19 +97,21 @@ class ZerostackApp:
             # without recording it would leave the run log, and therefore the
             # audit trail, silently incomplete the moment caching is enabled.
             if persist:
-                self._persist(cached)
+                self._persist(cached, namespace)
             return cached
-
-        self.context.namespace = namespace
 
         if self.settings.cost.enabled:
             # Checked before the call so the ceiling is a limit rather than a
-            # report of the overspend after the fact.
-            self.costs.check(projected_tokens=len(question.split()) * 2)
+            # report of the overspend after the fact. The projection has to
+            # include the completion the call is about to produce: checking the
+            # question alone, and a projected cost of zero, would let a short
+            # question through on a nearly spent budget and then overshoot it by
+            # a full response before anything was recorded.
+            self.costs.check(**self._projected_spend(question))
 
         try:
             with self.metrics.timer("zerostack_request_seconds"):
-                result = self.orchestrator.run(question)
+                result = self.orchestrator.run(question, namespace=namespace)
         except Exception:
             self.metrics.increment("zerostack_request_errors_total")
             raise
@@ -118,15 +120,16 @@ class ZerostackApp:
         self._cache_store(question, result, namespace)
 
         if persist:
-            self._persist(result)
+            self._persist(result, namespace)
 
         return result
 
-    def _persist(self, result: AgentResult) -> None:
+    def _persist(self, result: AgentResult, namespace: str = "default") -> None:
         """Record a run. Never allowed to fail the answer it is recording."""
         try:
             self.store.save_run(
                 RunRecord(
+                    namespace=namespace,
                     question=result.question,
                     answer=result.answer,
                     orchestrator=result.orchestrator,
@@ -229,6 +232,28 @@ class ZerostackApp:
         except Exception as exc:
             logger.debug("cache store skipped: %s", exc)
 
+    def _projected_spend(self, question: str) -> dict[str, float]:
+        """An upper bound on what this call may consume, before making it.
+
+        The completion is bounded by the configured ``max_tokens`` rather than
+        guessed, so the projection is a ceiling the call cannot exceed rather
+        than an estimate it might. Retrieved context is not known yet at this
+        point, so the prompt side is still a lower bound: this narrows the
+        overshoot to the retrieved passages, it does not remove it.
+        """
+        prompt_tokens = estimate_tokens(question)
+        completion_tokens = self.settings.llm.max_tokens
+        # Priced against the model that will actually serve, not the configured
+        # one. They differ whenever a layer has degraded to its fallback, and
+        # pricing the configured model would then charge a projection against a
+        # model that is not running, or miss the price table entirely.
+        model = getattr(self.llm, "model", "") or self.settings.llm.model
+        usage = self.costs.price(prompt_tokens, completion_tokens, model)
+        return {
+            "projected_tokens": usage.total_tokens,
+            "projected_cost_usd": usage.cost_usd,
+        }
+
     def _account(self, question: str, result: AgentResult) -> None:
         """Record token volume and estimated spend for this run."""
         if not self.settings.cost.enabled:
@@ -272,6 +297,10 @@ class ZerostackApp:
         # whole cache on each ingestion, which makes caching worthless for any
         # deployment that ingests on a schedule.
         invalidated = self.cache.invalidate_sources(report.sources) if report.sources else 0
+        # Answers that found nothing carry no source, so the call above cannot
+        # reach them. They are precisely the ones a new document may now answer.
+        if report.chunks:
+            invalidated += self.cache.invalidate_ungrounded(namespace)
         self.metrics.set_gauge("zerostack_documents_indexed", self.rag.store.count())
 
         return {
@@ -327,12 +356,18 @@ class ZerostackApp:
             },
         }
 
-    def analytics(self) -> dict[str, Any]:
-        """Aggregate run metrics from the data layer."""
-        return analytics_summary(self.settings.data.sqlite_path)
+    def analytics(self, namespaces: list[str] | None = None) -> dict[str, Any]:
+        """Aggregate run metrics from the data layer.
 
-    def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
-        return self.store.recent_runs(limit=limit)
+        ``namespaces`` restricts the aggregate to a caller's tenants. ``None``
+        means unrestricted and is for a caller holding wildcard access.
+        """
+        return analytics_summary(self.settings.data.sqlite_path, namespaces=namespaces)
+
+    def recent_runs(
+        self, limit: int = 20, namespaces: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        return self.store.recent_runs(limit=limit, namespaces=namespaces)
 
     def metrics_snapshot(self) -> dict[str, Any]:
         """Metric values as plain data, for the health endpoint and the UI."""
