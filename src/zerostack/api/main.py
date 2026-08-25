@@ -11,10 +11,11 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from zerostack.app import ZerostackApp
+from zerostack.observability import BudgetExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,10 @@ def ask(request: AskRequest) -> AskResponse:
         result = get_app().ask(request.question, persist=request.persist)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BudgetExceeded as exc:
+        # The ceiling was reached. That is a throttle, not a server fault, and a
+        # caller can retry once the window rolls over.
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("ask failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -115,6 +120,31 @@ def runs(limit: int = 20) -> dict[str, Any]:
 def analytics() -> dict[str, Any]:
     """Aggregate run metrics."""
     return get_app().analytics()
+
+
+@api.get("/metrics", response_class=Response)
+def metrics() -> Response:
+    """Metrics in the Prometheus text exposition format.
+
+    Served as plain text with the exposition content type so a standard scraper
+    can read it without any adapter.
+    """
+    return Response(
+        content=get_app().prometheus_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@api.get("/metrics.json")
+def metrics_json() -> dict[str, Any]:
+    """The same metrics as JSON, for dashboards and the browser frontend."""
+    return get_app().metrics_snapshot()
+
+
+@api.get("/costs")
+def costs() -> dict[str, Any]:
+    """Token volume, estimated spend and remaining budget."""
+    return get_app().costs.snapshot()
 
 
 @api.get("/tools")

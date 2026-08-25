@@ -15,8 +15,20 @@ from zerostack.config import Settings, get_settings
 from zerostack.data import RunRecord, StateStore, analytics_summary
 from zerostack.llm import build_llm
 from zerostack.llm.ollama import OllamaLLM
-from zerostack.observability import configure_logging, get_tracer
-from zerostack.orchestrator import AgentContext, AgentResult, build_orchestrator
+from zerostack.observability import (
+    CostTracker,
+    SemanticCache,
+    configure_logging,
+    get_metrics,
+    get_tracer,
+)
+from zerostack.observability.cost import DEFAULT_PRICES
+from zerostack.orchestrator import (
+    AgentContext,
+    AgentResult,
+    AgentStep,
+    build_orchestrator,
+)
 from zerostack.orchestrator.factory import available_engines
 from zerostack.rag import RAGPipeline
 from zerostack.tools import build_registry
@@ -35,6 +47,17 @@ class ZerostackApp:
         self.rag = RAGPipeline(settings=self.settings.rag)
         self.tools = build_registry(include_mcp=include_mcp)
         self.store = StateStore(self.settings.data.sqlite_path)
+        self.metrics = get_metrics()
+        self.costs = CostTracker(
+            prices=_parse_prices(self.settings.cost.price_table),
+            daily_token_budget=self.settings.cost.daily_token_budget,
+            daily_cost_budget_usd=self.settings.cost.daily_cost_budget_usd,
+        )
+        self.cache = SemanticCache(
+            threshold=self.settings.cache.threshold,
+            max_entries=self.settings.cache.max_entries,
+            ttl_seconds=self.settings.cache.ttl_seconds,
+        )
 
         self.context = AgentContext(
             llm=self.llm,
@@ -44,33 +67,61 @@ class ZerostackApp:
         )
         self.orchestrator = build_orchestrator(self.context, self.settings.orchestrator)
 
-    def ask(self, question: str, persist: bool = True) -> AgentResult:
+    def ask(self, question: str, persist: bool = True, use_cache: bool = True) -> AgentResult:
         """Run one question through the agent and record the result."""
         if not question or not question.strip():
             raise ValueError("question must not be empty")
+        question = question.strip()
 
-        result = self.orchestrator.run(question.strip())
+        self.metrics.increment("zerostack_requests_total")
+
+        cached = self._cache_lookup(question) if use_cache else None
+        if cached is not None:
+            # A cache hit is still a question somebody asked. Returning early
+            # without recording it would leave the run log, and therefore the
+            # audit trail, silently incomplete the moment caching is enabled.
+            if persist:
+                self._persist(cached)
+            return cached
+
+        if self.settings.cost.enabled:
+            # Checked before the call so the ceiling is a limit rather than a
+            # report of the overspend after the fact.
+            self.costs.check(projected_tokens=len(question.split()) * 2)
+
+        try:
+            with self.metrics.timer("zerostack_request_seconds"):
+                result = self.orchestrator.run(question)
+        except Exception:
+            self.metrics.increment("zerostack_request_errors_total")
+            raise
+
+        self._account(question, result)
+        self._cache_store(question, result)
 
         if persist:
-            try:
-                self.store.save_run(
-                    RunRecord(
-                        question=result.question,
-                        answer=result.answer,
-                        orchestrator=result.orchestrator,
-                        llm_provider=result.llm_provider,
-                        llm_model=result.llm_model,
-                        latency_ms=result.latency_ms,
-                        trace_id=result.trace_id,
-                        sources=result.sources,
-                        steps=[step.to_dict() for step in result.steps],
-                    )
-                )
-            except Exception as exc:
-                # Persistence must never fail a user facing answer.
-                logger.warning("could not persist run: %s", exc)
+            self._persist(result)
 
         return result
+
+    def _persist(self, result: AgentResult) -> None:
+        """Record a run. Never allowed to fail the answer it is recording."""
+        try:
+            self.store.save_run(
+                RunRecord(
+                    question=result.question,
+                    answer=result.answer,
+                    orchestrator=result.orchestrator,
+                    llm_provider=result.llm_provider,
+                    llm_model=result.llm_model,
+                    latency_ms=result.latency_ms,
+                    trace_id=result.trace_id,
+                    sources=result.sources,
+                    steps=[step.to_dict() for step in result.steps],
+                )
+            )
+        except Exception as exc:
+            logger.warning("could not persist run: %s", exc)
 
     def allowed_ingest_roots(self) -> list[Path]:
         """Directories an untrusted caller may ingest from."""
@@ -106,6 +157,77 @@ class ZerostackApp:
                 "to widen them."
             )
 
+    def _cache_lookup(self, question: str) -> AgentResult | None:
+        """Serve a close enough previous answer, if one exists."""
+        if not self.settings.cache.enabled:
+            return None
+        try:
+            embedding = self.rag.embeddings.embed_one(question)
+        except Exception as exc:
+            logger.debug("cache lookup skipped: %s", exc)
+            return None
+
+        # A fresh trace id per request, so two callers served the same cached
+        # answer are still distinguishable in the trace and the run log.
+        trace_id = get_tracer().new_trace()
+        lookup = self.cache.lookup(embedding)
+        self.metrics.increment(
+            "zerostack_cache_events_total",
+            labels={"outcome": "hit" if lookup.hit else "miss"},
+        )
+        if not lookup.hit or lookup.entry is None:
+            return None
+
+        entry = lookup.entry
+        return AgentResult(
+            answer=entry.answer,
+            question=question,
+            orchestrator=f"{self.orchestrator.name}+cache",
+            llm_provider="cache",
+            llm_model="cache",
+            latency_ms=0.0,
+            sources=list(entry.sources),
+            steps=[
+                AgentStep(
+                    name="cache",
+                    detail=f"served a previous answer, similarity {lookup.similarity:.3f}",
+                    data={"similarity": round(lookup.similarity, 4)},
+                )
+            ],
+            trace_id=trace_id,
+        )
+
+    def _cache_store(self, question: str, result: AgentResult) -> None:
+        if not self.settings.cache.enabled or not result.answer:
+            return
+        try:
+            self.cache.store(
+                question=question,
+                answer=result.answer,
+                embedding=self.rag.embeddings.embed_one(question),
+                sources=result.sources,
+            )
+        except Exception as exc:
+            logger.debug("cache store skipped: %s", exc)
+
+    def _account(self, question: str, result: AgentResult) -> None:
+        """Record token volume and estimated spend for this run."""
+        if not self.settings.cost.enabled:
+            return
+        usage = self.costs.estimate(question, result.answer, result.llm_model)
+        self.costs.record(usage)
+        self.metrics.increment(
+            "zerostack_llm_tokens_total", usage.prompt_tokens, labels={"direction": "prompt"}
+        )
+        self.metrics.increment(
+            "zerostack_llm_tokens_total",
+            usage.completion_tokens,
+            labels={"direction": "completion"},
+        )
+        if usage.cost_usd:
+            self.metrics.increment("zerostack_llm_cost_usd_total", usage.cost_usd)
+        self.metrics.observe("zerostack_llm_seconds", result.latency_ms / 1000.0)
+
     def ingest(self, path: Path | str | None = None, enforce_roots: bool = True) -> dict[str, Any]:
         """Ingest a file or directory into the vector store.
 
@@ -118,7 +240,18 @@ class ZerostackApp:
         if not target.exists():
             raise FileNotFoundError(f"nothing to ingest at {target}")
         report = self.rag.ingest_path(target)
+
+        # An answer built from a document that has since changed is worse than no
+        # cache at all, so ingestion drops exactly the entries it invalidates.
+        invalidated = (
+            self.cache.invalidate_sources([chunk.source for chunk in self.rag.store.iter_chunks()])
+            if report.chunks
+            else 0
+        )
+        self.metrics.set_gauge("zerostack_documents_indexed", self.rag.store.count())
+
         return {
+            "cache_entries_invalidated": invalidated,
             "path": str(target),
             "files": report.files,
             "chunks": report.chunks,
@@ -154,6 +287,8 @@ class ZerostackApp:
                     "sqlite_path": str(self.settings.data.sqlite_path),
                     "runs": self.store.count_runs(),
                 },
+                "cost": self.costs.snapshot(),
+                "cache": self.cache.snapshot(),
                 "observability": {
                     "enabled": self.settings.observability.enabled,
                     "export_traces": self.settings.observability.export_traces,
@@ -169,6 +304,34 @@ class ZerostackApp:
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.store.recent_runs(limit=limit)
 
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Metric values as plain data, for the health endpoint and the UI."""
+        return self.metrics.snapshot()
+
+    def prometheus_metrics(self) -> str:
+        """The registry in Prometheus text exposition format."""
+        return self.metrics.render_prometheus()
+
     def last_trace(self) -> list[dict[str, Any]]:
         """Return the spans recorded by the most recent run."""
         return get_tracer().summary()
+
+
+def _parse_prices(table: str) -> dict[str, tuple[float, float]]:
+    """Parse "model:prompt:completion" entries into a price table.
+
+    A malformed entry is skipped with a warning rather than raising, so one typo
+    in an environment variable cannot stop the application from starting.
+    """
+    prices = dict(DEFAULT_PRICES)
+    for item in (part.strip() for part in table.split(",") if part.strip()):
+        pieces = item.split(":")
+        if len(pieces) != 3:
+            logger.warning("ignoring malformed price entry %r", item)
+            continue
+        model, prompt_price, completion_price = pieces
+        try:
+            prices[model.strip()] = (float(prompt_price), float(completion_price))
+        except ValueError:
+            logger.warning("ignoring price entry with non numeric values %r", item)
+    return prices

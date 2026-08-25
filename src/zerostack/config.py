@@ -134,9 +134,43 @@ class ObservabilitySettings(BaseSettings):
     phoenix_endpoint: str = "http://localhost:6006/v1/traces"
     export_traces: bool = False
     log_level: str = "INFO"
+    metrics_enabled: bool = True
     trace_log_path: Path = DEFAULT_DATA_DIR / "traces.jsonl"
     # Caps the in memory span buffer. The JSONL log keeps the full history.
     max_retained_spans: int = 1000
+
+
+class CostSettings(BaseSettings):
+    """Token accounting and spend ceilings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_COST_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = True
+    # Zero means no ceiling. A ceiling is checked before a call, not after, so
+    # that it is a limit rather than a report of the overspend.
+    daily_token_budget: int = 0
+    daily_cost_budget_usd: float = 0.0
+    # Per million tokens as "model:prompt:completion", comma separated. Prices
+    # change often, so they are configuration rather than constants.
+    price_table: str = ""
+
+
+class CacheSettings(BaseSettings):
+    """Semantic answer cache."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ZEROSTACK_CACHE_", env_file=_DOTENV, env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = True
+    # High by default. A loose threshold serves the answer to a question that
+    # merely resembles the one asked, which is a correctness bug wearing the
+    # costume of a performance win.
+    threshold: float = 0.95
+    max_entries: int = 500
+    ttl_seconds: float = 3600.0
 
 
 class Settings(BaseSettings):
@@ -152,6 +186,8 @@ class Settings(BaseSettings):
     orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)
     data: DataSettings = Field(default_factory=DataSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    cost: CostSettings = Field(default_factory=CostSettings)
+    cache: CacheSettings = Field(default_factory=CacheSettings)
 
     def ensure_directories(self) -> None:
         """Create the directories the local backends write into."""
