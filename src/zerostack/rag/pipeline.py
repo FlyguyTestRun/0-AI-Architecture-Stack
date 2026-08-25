@@ -211,17 +211,49 @@ class RAGPipeline:
         self.graph = self._graph_for("default")
         self._keyword_chunks.clear()
         self._index_keywords(chunks)
+        self._rebuild_graphs({chunk.namespace for chunk in chunks})
         logger.info("rag layer: keyword and graph tiers rebuilt from %d chunk(s)", len(chunks))
 
     def _index_keywords(self, chunks: list[Chunk]) -> None:
+        """Index chunks for keyword search.
+
+        Keyed by chunk id, so re-ingesting a document replaces its entries rather
+        than duplicating them. The graph is not built here: a graph edge is not
+        addressed by chunk id and so cannot be replaced in place, which is why it
+        is rebuilt separately.
+        """
         for chunk in chunks:
             self.keyword.add(chunk.chunk_id, chunk.text)
             self._keyword_chunks[chunk.chunk_id] = chunk
-            if self.settings.graph_enabled:
-                # One graph per namespace. A shared graph would let a traversal
-                # walk from one tenant's entity into another tenant's document,
-                # which is exactly the boundary the namespace exists to draw.
-                self._graph_for(chunk.namespace).add_document(chunk.text, chunk.source)
+
+    def _rebuild_graphs(self, namespaces: set[str]) -> None:
+        """Rebuild the graph for each namespace from what the store now holds.
+
+        Appending the new text instead would leave the relations extracted from
+        the previous version of a document in place. After a correction, a
+        traversal would then present the old and the new fact side by side, both
+        cited to the same live source, with nothing to indicate which is current.
+        Edges carry no chunk identity, so there is nothing to replace in place and
+        the namespace has to be rebuilt.
+
+        One graph per namespace. A shared graph would let a traversal walk from
+        one tenant's entity into another tenant's document, which is exactly the
+        boundary the namespace exists to draw.
+        """
+        if not self.settings.graph_enabled or not namespaces:
+            return
+        try:
+            chunks = list(self.store.iter_chunks())
+        except Exception as exc:
+            logger.warning("could not rebuild the graph tier: %s", exc)
+            return
+        for namespace in namespaces:
+            graph = KnowledgeGraph()
+            for chunk in chunks:
+                if chunk.namespace == namespace:
+                    graph.add_document(chunk.text, chunk.source)
+            self._graphs[namespace] = graph
+        self.graph = self._graph_for("default")
 
     def _graph_for(self, namespace: str) -> KnowledgeGraph:
         graph = self._graphs.get(namespace)
@@ -236,6 +268,7 @@ class RAGPipeline:
         vectors = self.embeddings.embed([chunk.text for chunk in chunks])
         written = self.store.upsert(chunks, vectors)
         self._index_keywords(chunks)
+        self._rebuild_graphs({chunk.namespace for chunk in chunks})
         return written
 
     def _vector_search(self, query: str, limit: int) -> list[SearchResult]:

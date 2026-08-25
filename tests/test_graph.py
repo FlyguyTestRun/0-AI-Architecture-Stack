@@ -148,3 +148,71 @@ class TestContextFormatting:
     def test_relation_budget_is_respected(self, graph):
         rendered = format_graph_context(graph.traverse("Support Lead"), max_relations=1)
         assert rendered.count("\n- ") <= 1
+
+
+class TestGraphIsRebuiltOnReingest:
+    """A corrected document must not leave its old relations behind.
+
+    Vector and keyword entries are addressed by chunk id, so re-ingesting
+    replaces them. A graph edge carries no chunk identity, so appending the new
+    text leaves the previous version's relations in place and a traversal then
+    presents the old and the new fact side by side, both cited to the same live
+    source, with nothing to say which is current.
+    """
+
+    @pytest.fixture
+    def pipeline(self):
+        from zerostack.config import get_settings
+        from zerostack.rag.pipeline import RAGPipeline
+
+        settings = get_settings().rag
+        settings.backend = "memory"
+        return RAGPipeline(settings=settings)
+
+    def test_the_superseded_relation_is_gone(self, pipeline):
+        pipeline.ingest_text(
+            "The Support Lead reports to the Engineering Director. "
+            "The Engineering Director owns the escalation path.",
+            source="org.md",
+            source_id="default::org.md",
+        )
+        pipeline.ingest_text(
+            "The Support Lead reports to the Operations Director. "
+            "The Operations Director owns the escalation path.",
+            source="org.md",
+            source_id="default::org.md",
+        )
+        context = pipeline.graph_context("Who does the Support Lead report to?")
+        assert "Operations Director" in context
+        assert "Engineering Director" not in context
+
+    def test_rebuilding_one_namespace_leaves_another_alone(self, pipeline):
+        pipeline.ingest_text(
+            "The Legal Counsel reports to the General Counsel.",
+            source="legal.md",
+            source_id="legal::legal.md",
+            namespace="legal",
+        )
+        pipeline.ingest_text(
+            "The Support Lead reports to the Field Director.",
+            source="org.md",
+            source_id="default::org.md",
+        )
+        legal = pipeline.graph_context("Who does the Legal Counsel report to?", namespace="legal")
+        assert "General Counsel" in legal
+        assert "Support Lead" not in legal
+
+    def test_an_unrelated_document_still_contributes(self, pipeline):
+        """Rebuilding must not drop the documents it is not replacing."""
+        pipeline.ingest_text(
+            "The Support Lead reports to the Engineering Director.",
+            source="org.md",
+            source_id="default::org.md",
+        )
+        pipeline.ingest_text(
+            "The Billing Lead reports to the Finance Director.",
+            source="finance.md",
+            source_id="default::finance.md",
+        )
+        context = pipeline.graph_context("Who does the Support Lead report to?")
+        assert "Engineering Director" in context

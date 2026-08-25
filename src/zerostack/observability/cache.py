@@ -150,6 +150,25 @@ class SemanticCache:
                 del self._entries[key]
         return len(doomed)
 
+    def invalidate_ungrounded(self, namespace: str) -> int:
+        """Drop entries in ``namespace`` that were answered from no sources.
+
+        An answer with empty provenance was produced because retrieval found
+        nothing. It records no source, so source based invalidation can never
+        match it, and it would keep reporting "nothing found" for the rest of its
+        TTL after the very document that answers it was ingested. The absence
+        that justified the answer is exactly what ingestion changes.
+        """
+        with self._lock:
+            doomed = [
+                key
+                for key, entry in self._entries.items()
+                if entry.namespace == namespace and not entry.sources
+            ]
+            for key in doomed:
+                del self._entries[key]
+        return len(doomed)
+
     def invalidate_namespace(self, namespace: str) -> int:
         with self._lock:
             doomed = [key for key, entry in self._entries.items() if entry.namespace == namespace]
