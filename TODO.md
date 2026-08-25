@@ -88,7 +88,30 @@ Still open, and deliberately not started:
 - Per tenant encryption at rest. Needs a key management decision first.
 - An operator facing key rotation flow. The store hashes keys; nothing rotates them.
 
-### 5. Next.js frontend, PLANNED
+### 5. Commit authorship cleanup, NEEDS A DECISION
+
+The attribution policy was enforced on file contents and commit messages but not on
+the commit author field, so 17 commits carry an assistant account in the byline. That
+is the most visible place the rule can be broken: the name sits beside every commit
+in the history and on every pull request.
+
+The hook now blocks it and the local identity is set, so nothing new can land that
+way. The existing commits need a decision, because every option rewrites history:
+
+- 13 of the 17 are on the two open branches and are unmerged. Rewriting those is low
+  risk but changes every commit id and needs a force push to two stacked pull
+  requests, which would disrupt a review in progress.
+- 4 are already on the default branch. Rewriting those rewrites shared history.
+
+Recommended: rewrite the two unmerged branches with `git rebase --exec` or a filter,
+before the pull requests merge, and leave the default branch alone unless the
+history is going to be squashed anyway. Doing it after they merge means rewriting
+shared history instead.
+
+Not done unattended: force pushing two stacked pull requests is not reversible from
+the other side of a review.
+
+### 6. Next.js frontend, PLANNED
 
 The API exists for this. Deferred until a project needs a client facing UI.
 
@@ -108,6 +131,7 @@ Recorded rather than hidden.
 | Rate limiting is per process | Replicas each permit the full rate | Needs a shared limiter before horizontal scaling |
 | Namespace filter is not pushed into the backend | A scoped query over fetches | Correct but not efficient; push down before hundreds of tenants |
 | Graph extraction is deterministic | Finds relation, not relation type | Swap the extractor protocol where a model is available |
+| Existing commits carry an assistant author | 17 commits name one in the byline shown beside every commit and pull request | Needs a decision, see the open item below. New commits are blocked by the hook |
 
 ---
 
