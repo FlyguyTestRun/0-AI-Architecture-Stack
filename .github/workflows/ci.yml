@@ -47,6 +47,14 @@ jobs:
       - name: Demo smoke test
         run: zerostack demo
 
+      - name: Quality gate
+        # Retrieval quality has no exception to catch when it regresses, only a
+        # worse answer that still looks plausible, so it is measured rather than
+        # assumed. The thresholds are the current measured baseline.
+        run: |
+          zerostack ingest
+          zerostack evaluate --min-pass-rate 1.0 --min-recall 1.0
+
   orchestrator-matrix:
     name: Orchestrator ${{ matrix.engine }}
     runs-on: ubuntu-latest

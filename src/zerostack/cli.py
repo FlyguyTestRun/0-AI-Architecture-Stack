@@ -197,6 +197,63 @@ def analytics() -> None:
 
 
 @app.command()
+def evaluate(
+    dataset: Path = typer.Option(
+        Path("evals/baseline.json"), "--dataset", help="Golden dataset to run."
+    ),
+    min_pass_rate: float = typer.Option(0.0, help="Fail below this pass rate."),
+    min_recall: float = typer.Option(0.0, help="Fail below this mean recall."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the full report as JSON."),
+) -> None:
+    """Measure retrieval and answer quality against a golden dataset.
+
+    Retrieval quality has no exception to catch when it goes wrong, only a worse
+    answer that still looks plausible, so tuning without measuring is guesswork
+    and a regression ships while the tests stay green.
+    """
+    from zerostack.evals import load_dataset, run_evaluation
+
+    if not dataset.exists():
+        console.print(f"[red]no dataset at {dataset}[/]")
+        raise typer.Exit(code=1)
+
+    instance = ZerostackApp()
+    report = run_evaluation(instance, load_dataset(dataset))
+
+    if as_json:
+        console.print_json(json.dumps(report.to_dict()))
+    else:
+        table = Table(title=f"Evaluation: {report.dataset}")
+        table.add_column("Result", style="bold")
+        table.add_column("Question", overflow="fold")
+        table.add_column("Recall", justify="right")
+        table.add_column("MRR", justify="right")
+        for result in report.results:
+            table.add_row(
+                "[green]pass[/]" if result.passed else "[red]fail[/]",
+                result.case.question[:60],
+                f"{result.scores.recall:.2f}",
+                f"{result.scores.reciprocal_rank:.2f}",
+            )
+        console.print(table)
+        console.print(report.summary_line())
+        for failure in report.failures:
+            console.print(
+                f"[red]failed[/] {failure.case.question}\n"
+                f"  missing: {failure.missing_phrases or 'none'}\n"
+                f"  leaked: {failure.leaked_phrases or 'none'}\n"
+                f"  retrieved: {failure.retrieved_sources}"
+            )
+
+    if not report.meets(min_pass_rate=min_pass_rate, min_recall=min_recall):
+        console.print(
+            f"[red]below threshold[/] pass rate {report.pass_rate:.2f} "
+            f"(min {min_pass_rate}), recall {report.mean_recall:.2f} (min {min_recall})"
+        )
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def serve(
     host: str = typer.Option("127.0.0.1", help="Bind address."),
     port: int = typer.Option(8000, help="Port."),
