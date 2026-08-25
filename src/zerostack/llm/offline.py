@@ -78,6 +78,13 @@ def _tokenize(text: str) -> list[str]:
 
 _CITATION_HEADER_RE = re.compile(r"^\[\d+\]\s+source:\s+\S+\s*$", re.MULTILINE)
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+.*$", re.MULTILINE)
+# Scaffolding the graph tier adds around its evidence. These lines label the
+# context; they are not part of it. Scoring them let the labels outrank the
+# sentences they introduce, which is the same defect citation headers caused.
+_GRAPH_LABEL_RE = re.compile(r"^(Relationships across documents:|Related to:.*)$", re.MULTILINE)
+# "- subject and object [source.md]: evidence sentence" keeps the evidence and
+# drops the triple, which is machine syntax rather than something to quote.
+_GRAPH_RELATION_PREFIX_RE = re.compile(r"^-\s+.*?\s+\[[^\]]+\]:\s*", re.MULTILINE)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -89,6 +96,8 @@ def _split_sentences(text: str) -> list[str]:
     """
     cleaned = _CITATION_HEADER_RE.sub("", text)
     cleaned = _MARKDOWN_HEADING_RE.sub("", cleaned)
+    cleaned = _GRAPH_LABEL_RE.sub("", cleaned)
+    cleaned = _GRAPH_RELATION_PREFIX_RE.sub("", cleaned)
     parts = re.split(r"(?<=[.!?])\s+|\n{2,}", cleaned)
     return [p.strip() for p in parts if len(p.strip()) > 20]
 
@@ -160,7 +169,16 @@ class OfflineLLM:
             return " ".join(sentences)
 
         scored: list[tuple[float, int, str]] = []
+        # The same sentence can reach the context twice, once as a retrieved
+        # passage and once as graph evidence. Without this the answer repeats
+        # itself verbatim, which reads like a defect even though both copies are
+        # legitimately present in the input.
+        seen: set[str] = set()
         for index, sentence in enumerate(_split_sentences(context)):
+            fingerprint = " ".join(sentence.lower().split())
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
             terms = _tokenize(sentence)
             if not terms:
                 continue

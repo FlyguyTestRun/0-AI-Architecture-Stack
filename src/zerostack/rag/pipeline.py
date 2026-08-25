@@ -10,6 +10,7 @@ from zerostack.config import RAGSettings, get_settings
 from zerostack.observability import get_tracer
 from zerostack.rag.chunking import Chunk, chunk_text
 from zerostack.rag.embeddings import EmbeddingProvider, build_embeddings
+from zerostack.rag.graph import KnowledgeGraph, format_graph_context
 from zerostack.rag.keyword import BM25Index, reciprocal_rank_fusion
 from zerostack.rag.store import (
     ChromaVectorStore,
@@ -103,6 +104,7 @@ class RAGPipeline:
         self.store = store or build_vector_store(self.settings)
         self.store.ensure_collection(self.embeddings.dimensions)
         self.keyword = BM25Index()
+        self.graph = KnowledgeGraph()
         self._keyword_chunks: dict[str, Chunk] = {}
         # The vector store may already hold documents from a previous process
         # while the keyword index starts empty every time, so it is rebuilt from
@@ -184,14 +186,17 @@ class RAGPipeline:
         if not chunks:
             return
         self.keyword.clear()
+        self.graph.clear()
         self._keyword_chunks.clear()
         self._index_keywords(chunks)
-        logger.info("rag layer: keyword index rebuilt from %d chunk(s)", len(chunks))
+        logger.info("rag layer: keyword and graph tiers rebuilt from %d chunk(s)", len(chunks))
 
     def _index_keywords(self, chunks: list[Chunk]) -> None:
         for chunk in chunks:
             self.keyword.add(chunk.chunk_id, chunk.text)
             self._keyword_chunks[chunk.chunk_id] = chunk
+            if self.settings.graph_enabled:
+                self.graph.add_document(chunk.text, chunk.source)
 
     def _upsert(self, chunks: list[Chunk]) -> int:
         if not chunks:
@@ -304,6 +309,27 @@ class RAGPipeline:
             return results
         return [result for result in results if result.score >= best * ratio]
 
+    def graph_context(self, query: str) -> str:
+        """Relations connecting the entities this query names, as prompt context.
+
+        Returns an empty string when the graph knows none of the query's
+        entities, so a question the graph cannot help with costs nothing.
+        """
+        if not self.settings.graph_enabled or self.graph.relation_count == 0:
+            return ""
+        with get_tracer().span("rag.graph_traverse", query=query) as span:
+            neighbourhood = self.graph.traverse(
+                query,
+                hops=self.settings.graph_hops,
+                max_entities=self.settings.graph_max_entities,
+            )
+            span.set(
+                seeds=neighbourhood.seeds,
+                entities=len(neighbourhood.entities),
+                relations=len(neighbourhood.relations),
+            )
+        return format_graph_context(neighbourhood, self.settings.graph_max_relations)
+
     @staticmethod
     def format_context(results: list[SearchResult]) -> str:
         """Render retrieved chunks into a prompt friendly block with citations."""
@@ -325,4 +351,5 @@ class RAGPipeline:
             "indexed_chunks": self.store.count(),
             "retrieval_mode": self.settings.retrieval_mode,
             "keyword_index_size": self.keyword.size,
+            "graph": self.graph.describe(),
         }

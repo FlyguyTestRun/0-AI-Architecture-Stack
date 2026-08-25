@@ -105,3 +105,63 @@ class TestRegistry:
     def test_auto_falls_back_when_ollama_is_missing(self):
         client = build_llm(LLMSettings(provider="auto", base_url="http://127.0.0.1:1"))
         assert client.name == "offline"
+
+
+class TestScaffoldingAndDuplicates:
+    """Context now carries graph scaffolding as well as citation headers.
+
+    Structural text labels the context; it is not part of it. Scoring it let a
+    label outrank the sentence it introduced, which is the same defect citation
+    headers caused before they were stripped.
+    """
+
+    GRAPH_CONTEXT = (
+        f"{CONTEXT_PREFIX}\n\n[1] source: escalation.md\n"
+        "The Escalation Policy is owned by the Engineering Director.\n\n"
+        "Relationships across documents:\n"
+        "Related to: support lead, engineering director\n"
+        "- support lead and refund policy [refunds.md]: "
+        "The Refund Policy is owned by the Support Lead."
+    )
+
+    def test_graph_labels_do_not_reach_the_answer(self):
+        response = OfflineLLM().complete(
+            [
+                ChatMessage(role="system", content=self.GRAPH_CONTEXT),
+                ChatMessage(role="user", content="Who owns the Refund Policy?"),
+            ]
+        )
+        assert "Relationships across documents" not in response.text
+        assert "Related to:" not in response.text
+
+    def test_graph_evidence_still_reaches_the_answer(self):
+        response = OfflineLLM().complete(
+            [
+                ChatMessage(role="system", content=self.GRAPH_CONTEXT),
+                ChatMessage(role="user", content="Who owns the Refund Policy?"),
+            ]
+        )
+        assert "Support Lead" in response.text
+
+    def test_the_relation_triple_is_dropped_but_not_its_evidence(self):
+        response = OfflineLLM().complete(
+            [
+                ChatMessage(role="system", content=self.GRAPH_CONTEXT),
+                ChatMessage(role="user", content="Who owns the Refund Policy?"),
+            ]
+        )
+        assert "[refunds.md]:" not in response.text
+
+    def test_a_sentence_present_twice_appears_once(self):
+        """The same sentence can arrive as a passage and as graph evidence."""
+        duplicated = (
+            f"{CONTEXT_PREFIX}\n\nThe Support Lead owns the Refund Policy.\n\n"
+            "The Support Lead owns the Refund Policy."
+        )
+        response = OfflineLLM().complete(
+            [
+                ChatMessage(role="system", content=duplicated),
+                ChatMessage(role="user", content="Who owns the Refund Policy?"),
+            ]
+        )
+        assert response.text.count("The Support Lead owns the Refund Policy") == 1

@@ -77,6 +77,12 @@ class RAGSettings(BaseSettings):
     # Candidates pulled from each retriever before fusion. Wider than top_k so
     # fusion has room to promote something the other retriever ranked highly.
     fusion_candidates: int = 20
+    # The graph tier answers questions whose answer is spread across documents
+    # that never mention each other, which passage retrieval cannot reach.
+    graph_enabled: bool = True
+    graph_hops: int = 2
+    graph_max_entities: int = 25
+    graph_max_relations: int = 12
     score_threshold: float = 0.0
     # Drop any hit scoring below this fraction of the best hit. An absolute threshold
     # is not portable across embedding backends, a relative one is.

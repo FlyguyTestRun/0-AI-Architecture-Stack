@@ -512,3 +512,43 @@ class TestHybridRetrieval:
         )
         assert second.keyword.size == 1, "keyword tier was lost across the restart"
         assert second.retrieve("E-4471", top_k=2)[0].source == "errors.md"
+
+
+class TestGraphTier:
+    @pytest.fixture
+    def pipeline(self, settings):
+        settings.rag.graph_enabled = True
+        built = RAGPipeline(
+            store=MemoryVectorStore(),
+            embeddings=HashingEmbeddings(dimensions=256),
+            settings=settings.rag,
+        )
+        built.ingest_text("The Refund Policy is owned by the Support Lead.", source="refunds.md")
+        built.ingest_text(
+            "The Escalation Policy is owned by the Engineering Director. "
+            "The Escalation Policy governs Severity 1 handling.",
+            source="escalation.md",
+        )
+        built.ingest_text("The Support Lead may raise a ticket to Severity 1.", source="oncall.md")
+        return built
+
+    def test_the_graph_is_built_during_ingestion(self, pipeline):
+        assert pipeline.graph.relation_count > 0
+
+    def test_graph_context_connects_across_documents(self, pipeline):
+        rendered = pipeline.graph_context(
+            "What links the Support Lead to the Engineering Director?"
+        )
+        assert "escalation.md" in rendered or "oncall.md" in rendered
+
+    def test_an_unknown_entity_costs_nothing(self, pipeline):
+        assert pipeline.graph_context("quantum chromodynamics") == ""
+
+    def test_the_tier_can_be_disabled(self, pipeline):
+        pipeline.settings.graph_enabled = False
+        assert pipeline.graph_context("Support Lead") == ""
+
+    def test_describe_reports_the_graph(self, pipeline):
+        described = pipeline.describe()["graph"]
+        assert described["entities"] > 0
+        assert described["extractor"] == "pattern"
