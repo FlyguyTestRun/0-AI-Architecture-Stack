@@ -1,7 +1,7 @@
 # Task queue
 
 **Last updated:** 2026-08-25
-**Current phase:** Platform expansion shipped, hardening the metered surfaces
+**Current phase:** Platform expansion shipped, review findings closed
 **Active mode:** BUILD
 
 ---
@@ -136,6 +136,31 @@ Recorded rather than hidden.
 ---
 
 ## Change log
+
+### 2026-08-25, external review round
+
+An automated reviewer raised seven findings against the expansion. One had
+already been fixed independently in the pass below (the daily budget window),
+which is a useful corroboration rather than a duplicate. The other six were
+verified by reproducing each before changing anything, then fixed.
+
+| Finding | Verified how | Fix |
+|---------|--------------|-----|
+| The namespace lived on a process wide context, so concurrent requests crossed tenants | Instrumented at the read: a request asking for `hr` retrieved against `legal` once in eighty | The namespace travels in orchestrator state and the shared field is removed |
+| A broken principal table resolved every caller to a local administrator | Malformed JSON, a missing configured file and an all invalid table each returned open admin access | Supplied but unusable is now a distinct state that refuses everyone |
+| The run log and analytics were not scoped by namespace | An operator restricted to `hr` could read `legal` questions, answers and retrieved text | Runs store their namespace; both endpoints filter by the caller's grant |
+| Re ingesting a document left its superseded graph relations in place | A corrected reporting line returned both the old and the new relation, both cited to the same live source | Upsert rebuilds the affected namespace graph from the store |
+| Cache entries with no sources were never invalidated | A question asked before its document existed kept returning "nothing found" after ingestion | Ingestion also drops ungrounded entries in the target namespace |
+| The spend ceiling projected zero dollars | A short question passed a nearly spent budget and overshot by a full response | The projection bounds the completion at `max_tokens`, priced against the model that will serve |
+
+One bug of my own was caught while fixing these: the run table migration created
+an index on the new column before adding the column, so any database written
+before this change failed to open. Found by testing the migration against a
+legacy database rather than only a fresh one.
+
+Tests 401 to 429. Every fix was reproduced failing first, and each regression
+test was then confirmed to fail against the old behaviour. Recorded as ZS-010
+and ZS-011, with an addendum to ZS-009.
 
 ### 2026-08-25, hardening the metered surfaces
 

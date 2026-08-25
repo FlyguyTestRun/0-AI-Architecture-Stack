@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from zerostack.app import ZerostackApp
 from zerostack.observability.cache import SemanticCache
 from zerostack.observability.cost import (
     BudgetExceeded,
@@ -320,3 +321,51 @@ class TestDailyBudgetWindow:
         # The 50 from the previous day must not survive the boundary.
         assert tracker.tokens_used == 2000
         assert tracker.window_day == "2026-08-26"
+
+
+class TestSpendIsReservedBeforeTheCall:
+    """A ceiling checked against the question alone is not a ceiling.
+
+    Projecting zero dollars and only the question's tokens lets a short question
+    through on a nearly spent budget, which then produces a full response and
+    overshoots before anything is recorded.
+    """
+
+    @pytest.fixture
+    def priced_app(self, settings, corpus_dir, tmp_path):
+        settings.rag.corpus_dir = corpus_dir
+        settings.data.sqlite_path = tmp_path / "runs.db"
+        settings.cache.enabled = False
+        settings.cost.enabled = True
+        settings.llm.max_tokens = 1024
+        settings.cost.price_table = "offline:10:30"
+        return settings
+
+    def test_the_projection_includes_the_completion(self, priced_app):
+        app = ZerostackApp(settings=priced_app, include_mcp=False)
+        projected = app._projected_spend("How long is the probationary period?")
+        # The question is a handful of tokens; the ceiling on the response is
+        # 1024, so the projection has to be dominated by the completion.
+        assert projected["projected_tokens"] > priced_app.llm.max_tokens
+        assert projected["projected_cost_usd"] > 0
+
+    def test_a_call_that_would_breach_the_ceiling_is_refused_first(self, priced_app):
+        priced_app.cost.daily_cost_budget_usd = 0.001
+        app = ZerostackApp(settings=priced_app, include_mcp=False)
+        app.ingest(str(priced_app.rag.corpus_dir), enforce_roots=False)
+        with pytest.raises(BudgetExceeded):
+            app.ask("How long is the probationary period?", persist=False)
+
+    def test_a_generous_ceiling_still_allows_the_call(self, priced_app):
+        priced_app.cost.daily_cost_budget_usd = 100.0
+        app = ZerostackApp(settings=priced_app, include_mcp=False)
+        app.ingest(str(priced_app.rag.corpus_dir), enforce_roots=False)
+        assert app.ask("How long is the probationary period?", persist=False).answer
+
+    def test_the_projection_prices_the_model_that_will_serve(self, priced_app):
+        """Not the configured one: they differ whenever a layer has degraded."""
+        app = ZerostackApp(settings=priced_app, include_mcp=False)
+        assert app.llm.model != priced_app.llm.model
+        # "offline" is the only priced entry, so a non zero cost proves the
+        # projection used the live provider rather than the configured model.
+        assert app._projected_spend("anything")["projected_cost_usd"] > 0

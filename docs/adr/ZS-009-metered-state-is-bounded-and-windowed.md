@@ -77,6 +77,22 @@ Bad, and accepted:
   cited was rewritten, even when the rewrite did not touch the cited passage.
   Serving a stale answer is the worse failure.
 
+## Addendum, same day
+
+An external review raised a fourth case of the same shape on the spend ceiling
+itself. The pre call check projected only the question's tokens and a cost of
+zero, so a short question passed on a nearly spent budget and then produced a
+full response, overshooting before anything was recorded. A ceiling checked
+against an input that excludes the largest term is not a ceiling.
+
+The projection now bounds the completion at the configured `max_tokens` and
+prices it against the model that will actually serve, which is not always the
+configured one: a degraded layer runs its fallback, and pricing the configured
+model would charge against something that is not running. The prompt side
+remains a lower bound, because retrieved context is not known at the time of the
+check. This narrows the overshoot to the retrieved passages rather than removing
+it, and that is stated here so the remaining gap is not mistaken for closed.
+
 ## Notes
 
 The general rule this encodes: any value that a caller controls and the system
