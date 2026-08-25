@@ -194,3 +194,66 @@ class TestDotenvLoading:
     def test_process_environment_still_wins_over_dotenv(self, dotenv_dir, monkeypatch):
         monkeypatch.setenv("ZEROSTACK_LLM_PROVIDER", "echo")
         assert Settings().llm.provider == "echo"
+
+
+class TestCacheInvalidationIsTargeted:
+    """Ingestion must drop the answers it actually invalidated, not all of them.
+
+    Passing every source in the store to the invalidator is correct but
+    worthless: it clears the whole cache on every ingestion, so any deployment
+    that ingests on a schedule never serves a cached answer at all.
+    """
+
+    def test_ingesting_an_unrelated_document_keeps_the_cache(self, app, corpus_dir, tmp_path):
+        """The sharp case: nothing cached cites the new file, so nothing drops."""
+        app.ingest(str(corpus_dir), enforce_roots=False)
+        app.ask("How long is the probationary period?", persist=False)
+        app.ask("How much can a support agent refund without approval?", persist=False)
+        cached = app.cache.size
+        assert cached == 2
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "unrelated.md").write_text(
+            "The cafeteria serves lunch from eleven until two.", encoding="utf-8"
+        )
+        result = app.ingest(str(elsewhere), enforce_roots=False)
+
+        assert result["cache_entries_invalidated"] == 0
+        assert app.cache.size == cached
+
+    def test_the_report_names_what_it_wrote(self, app, corpus_dir):
+        report = app.rag.ingest_path(corpus_dir)
+        assert sorted(report.sources) == ["onboarding.md", "support.md"]
+        # The unsupported file is skipped, so it is not reported as a source.
+        assert not any(source.endswith(".png") for source in report.sources)
+
+    def test_a_single_file_ingest_reports_only_that_file(self, app, corpus_dir):
+        report = app.rag.ingest_path(corpus_dir / "support.md")
+        assert report.sources == ["support.md"]
+
+    def test_an_answer_grounded_in_a_rewritten_document_is_dropped(self, app, corpus_dir):
+        """Conservative on purpose: any cited source changing invalidates."""
+        app.ingest(str(corpus_dir), enforce_roots=False)
+        result = app.ask("How much can a support agent refund without approval?", persist=False)
+        assert "support.md" in result.sources
+        assert app.cache.size == 1
+
+        (corpus_dir / "support.md").write_text(
+            "A support agent may refund up to five hundred dollars without approval.",
+            encoding="utf-8",
+        )
+        app.ingest(str(corpus_dir / "support.md"), enforce_roots=False)
+        assert app.cache.size == 0
+
+    def test_an_ingestion_that_wrote_nothing_invalidates_nothing(self, app, corpus_dir, tmp_path):
+        app.ingest(str(corpus_dir), enforce_roots=False)
+        app.ask("How long is the probationary period?", persist=False)
+        before = app.cache.size
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        result = app.ingest(str(empty), enforce_roots=False)
+
+        assert result["cache_entries_invalidated"] == 0
+        assert app.cache.size == before

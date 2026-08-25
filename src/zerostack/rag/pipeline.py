@@ -80,10 +80,16 @@ class IngestReport:
     files: int = 0
     chunks: int = 0
     skipped: list[str] = None  # type: ignore[assignment]
+    # The display sources this run actually wrote. The answer cache invalidates
+    # by source, and without this a caller has nothing to invalidate against but
+    # the whole store, which drops every cached answer on every ingestion.
+    sources: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.skipped is None:
             self.skipped = []
+        if self.sources is None:
+            self.sources = []
 
 
 class RAGPipeline:
@@ -173,9 +179,10 @@ class RAGPipeline:
                 # Making identity relative to the ingest argument was not enough:
                 # ingesting two sibling directories separately still collided, and
                 # ingesting a parent then a child left a stale duplicate behind.
+                source = self._display_source(file_path, path)
                 count = self.ingest_text(
                     content,
-                    source=self._display_source(file_path, path),
+                    source=source,
                     # Namespaced so the same file ingested into two namespaces
                     # produces two independent chunks rather than one shared one.
                     source_id=f"{namespace}::{file_path.resolve().as_posix()}",
@@ -184,6 +191,8 @@ class RAGPipeline:
                 if count:
                     report.files += 1
                     report.chunks += count
+                    if source not in report.sources:
+                        report.sources.append(source)
             span.set(files=report.files, chunks=report.chunks)
 
         return report
